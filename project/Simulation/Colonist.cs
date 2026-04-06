@@ -7,10 +7,15 @@ public class Colonist
     public int X;
     public int Y;
     public int Z;
+    public int WaitTimer = 0;
 
-    public int TargetX;
-    public int TargetY;
-    public int TargetZ;
+    public Vector3I Target;
+    public int RepathTimer = 0;
+
+    public float MoveProgress = 0f;
+    public float MoveSpeed = 3f;
+
+    public bool HasPathFailed = false;
     public List<Vector3I> Path = new();
 
     public Colonist()
@@ -18,32 +23,14 @@ public class Colonist
         X= 0;
         Y = 0;
         Z = 0;
-        TargetX = 0;
-        TargetY = 0;
-        TargetZ = 0;
+        Target = new Vector3I(0, 0, 0);
     }
 
-        public Colonist(int spawnX ,int spawnY, int spawnZ)
+    public Colonist(int spawnX ,int spawnY, int spawnZ)
     {
         X= spawnX;
         Y = spawnY;
         Z = spawnZ;
-        TargetX = 0;
-        TargetY = 0;
-        TargetZ = 0;
-    }
-
-
-
-    public void Update(Map map)
-    {
-        if (X < TargetX) X++;
-        else if (X > TargetX) X--;
-
-        if (Y < TargetY) Y++;
-        else if (Y > TargetY) Y--;
-
-        if (Z < TargetZ) Z++;
-        else if (Z > TargetZ) Z--;
+        Target = new Vector3I(0, 0, 0);
     }
 }

@@ -22,30 +22,34 @@ public class UnitController
         {
             var pos = GetMouseWorldPosition();
 
-            int i = 0;
+            HashSet<Vector3I> reserved = new();
 
             foreach (var colon in selected)
             {
-                int offsetX = i % 3;
-                int offsetY = i / 3;
+                var finalTarget = sim.FindNearestFreeWithReservation(pos, reserved);
+
+                reserved.Add(finalTarget);
+
+                var index = sim.World.CurrentMap.Colonists.IndexOf(colon);
 
                 var cmd = new PlayerCommand
                 {
                     Tick = sim.Tick + 1,
                     Type = "MOVE",
-                    EntityId = sim.World.CurrentMap.Colonists.IndexOf(colon),
-                    X = (int)pos.X,
-                    Y = 0, // sol
-                    Z = (int)pos.Z
+                    EntityId = index,
+                    X = finalTarget.X,
+                    Y = finalTarget.Y,
+                    Z = finalTarget.Z
                 };
 
                 lockstep.AddCommand(cmd);
-                i++;
+                GD.Print("CLICK TARGET: ", finalTarget);
+                GD.Print("CLICK GRID: ", pos);
             }
         }
     }
 
-    Vector3 GetMouseWorldPosition()
+    Vector3I GetMouseWorldPosition()
     {
         var mousePos = camera.GetViewport().GetMousePosition();
 
@@ -58,8 +62,17 @@ public class UnitController
         var result = space.IntersectRay(query);
 
         if (result.Count > 0)
-            return (Vector3)result["position"];
+        {
+            var pos = (Vector3)result["position"];
 
-        return Vector3.Zero;
+            int x = Mathf.FloorToInt(pos.X);
+            int y = Mathf.FloorToInt(pos.Y);
+            int z = Mathf.FloorToInt(pos.Z);
+
+            // 🔥 TOUJOURS viser au-dessus du bloc
+            return new Vector3I(x, y + 1, z);
+        }
+
+        return Vector3I.Zero;
     }
 }

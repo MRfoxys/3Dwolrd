@@ -1,4 +1,5 @@
 public class Tile
 {
-        public bool Solid;
+        public bool Solid = false;
+        public string Type = "air"; 
 }

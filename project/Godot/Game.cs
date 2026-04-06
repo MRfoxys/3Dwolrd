@@ -43,6 +43,7 @@ public partial class Game : Node3D
 
         InitSimulation();
         SpawnVisuals();
+        SpawnTiles();
 
         cameraController = new CameraController(cameraPivot, camera);
         selectionManager = new SelectionManager(camera, colonVisuals, localPlayerId);
@@ -62,21 +63,7 @@ public partial class Game : Node3D
             accumulator -= TICK_RATE;
         }
 
-        if (selectionManager.IsDragging)
-        {
-            selectionRect.Visible = true;
-
-            var rect = selectionManager.GetScreenRect();
-
-            selectionRect.Position = rect.Position;
-            selectionRect.Size = rect.Size;
-        }
-        else
-        {
-            selectionRect.Visible = false;
-        }
-
-
+        UpdateSelectionRect();
 
         Render();
         cameraController.Update(delta);
@@ -91,7 +78,6 @@ public partial class Game : Node3D
 
     void Step()
     {
-        
         var cmds = lockstep.GetCommandsForTick(sim.Tick);
 
         foreach (var cmd in cmds)
@@ -106,15 +92,16 @@ public partial class Game : Node3D
         {
             var colon = pair.Key;
             var node = pair.Value;
+            var targetPos = new Vector3(colon.X, colon.Y, colon.Z);
 
             var mesh = node.GetNode<MeshInstance3D>("MeshInstance3D");
 
-            if (selectionManager.SelectedColonists.Contains(colon))
-                mesh.MaterialOverride = selectedMat;
-            else
-                mesh.MaterialOverride = defaultMat;
+                mesh.MaterialOverride =
+                selectionManager.SelectedColonists.Contains(colon)
+                ? selectedMat
+                : defaultMat;
 
-            node.Position = new Vector3(colon.X, colon.Y + 0.5f, colon.Z);
+            node.Position = node.Position.Lerp(targetPos, 0.2f);
         }
     }
 
@@ -124,6 +111,8 @@ public partial class Game : Node3D
         {
             var instance = colonScene.Instantiate<Node3D>();
             AddChild(instance);
+            
+            instance.Position = new Vector3(colon.X, colon.Y, colon.Z);
 
             colonVisuals[colon] = instance;
         }
@@ -133,15 +122,37 @@ public partial class Game : Node3D
     {
         sim.World = new World();
 
-        var map = new Map(20, 20, 20);
+        var map = new Map();
+        var chunk = new Chunk(16);
+
+
+        // sol
+        for (int x = 0; x < 16; x++)
+        for (int z = 0; z < 16; z++)
+        {
+            chunk.Tiles[x, 0, z] = new Tile { Solid = true, Type = "ground" };
+        }
+
+        // plateforme
+        for (int x = 4; x < 8; x++)
+        for (int z = 4; z < 8; z++)
+        {
+            chunk.Tiles[x, 2, z] = new Tile { Solid = true, Type = "platform" };
+        }
+
+        // escalier simple
+        chunk.Tiles[4, 1, 4] = new Tile { Solid = true, Type = "stairs" };
+
+        map.Chunks[new Vector3I(0, 0, 0)] = chunk;
         
+        // colons
         for (int i = 0; i < 5; i++)
         {
             var colon = new Colonist
             {
-                X = 5 + i * 2,
+                X = 5 + i,
                 Y = 1,
-                Z = 5,
+                Z = 2,
                 OwnerId = 0
             };
 
@@ -150,6 +161,96 @@ public partial class Game : Node3D
 
         sim.World.Maps.Add(map);
         sim.World.CurrentMap = map;
+
         sim.Init();
     }
+
+    void SpawnTiles()
+    {
+        var map = sim.World.CurrentMap;
+
+        foreach (var chunkPair in map.Chunks)
+        {
+            var chunkPos = chunkPair.Key;
+            var chunk = chunkPair.Value;
+
+            int size = map.ChunkSize;
+
+            for (int x = 0; x < size; x++)
+            for (int y = 0; y < size; y++)
+            for (int z = 0; z < size; z++)
+            {
+                var tile = chunk.Tiles[x, y, z];
+
+                if (tile == null || !tile.Solid)
+                    continue;
+
+                var worldPos = new Vector3I(
+                    chunkPos.X * size + x,
+                    chunkPos.Y * size + y,
+                    chunkPos.Z * size + z
+                );
+
+                SpawnTile(worldPos, tile);
+            }
+        }
+    }
+
+        void SpawnTile(Vector3I pos, Tile tile)
+    {
+        var body = new StaticBody3D();
+
+        var mesh = new MeshInstance3D();
+        mesh.Mesh = new BoxMesh();
+
+        var collision = new CollisionShape3D();
+        collision.Shape = new BoxShape3D();
+
+        body.AddChild(mesh);
+        body.AddChild(collision);
+
+        body.Position = new Vector3(pos.X, pos.Y, pos.Z);
+
+        var mat = new StandardMaterial3D();
+
+        switch (tile.Type)
+        {
+            case "ground":
+                mat.AlbedoColor = new Color(0.4f, 0.25f, 0.1f);
+                break;
+
+            case "platform":
+                mat.AlbedoColor = new Color(1.0f, 0.5f, 0.0f);
+                break;
+
+            case "stairs":
+                mat.AlbedoColor = new Color(0.8f, 0.8f, 0.2f);
+                break;
+
+            default:
+                mat.AlbedoColor = new Color(1, 1, 1);
+                break;
+        }
+
+        mesh.MaterialOverride = mat;
+
+        AddChild(body);
+    }
+
+    void UpdateSelectionRect()
+    {
+        if (selectionManager.IsDragging)
+        {
+            selectionRect.Visible = true;
+
+            var rect = selectionManager.GetScreenRect();
+            selectionRect.Position = rect.Position;
+            selectionRect.Size = rect.Size;
+        }
+        else
+        {
+            selectionRect.Visible = false;
+        }
+    }
+    
 }

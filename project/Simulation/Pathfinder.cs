@@ -4,22 +4,22 @@ using Godot;
 
 public class Pathfinder
 {
-    Tile[,,] world;
     int sizeX, sizeY, sizeZ;
+    Func<Vector3I, bool> isOccupied;
+    Func<Vector3I, Tile> getTile;
 
     Vector3I[] directions = new Vector3I[]
     {
-        new(1,0,0), new(-1,0,0),
-        new(0,0,1), new(0,0,-1),
-        new(0,1,0), new(0,-1,0)
+        new(1,0,0),
+        new(-1,0,0),
+        new(0,0,1),
+        new(0,0,-1)
     };
 
-    public Pathfinder(Tile[,,] world)
+    public Pathfinder(Func<Vector3I, Tile> getTile, Func<Vector3I,bool> isOccupied)
     {
-        this.world = world;
-        sizeX = world.GetLength(0);
-        sizeY = world.GetLength(1);
-        sizeZ = world.GetLength(2);
+        this.getTile = getTile;
+        this.isOccupied = isOccupied;
     }
 
     class Node
@@ -40,14 +40,24 @@ public class Pathfinder
 
     bool InBounds(Vector3I p)
     {
-        return p.X >= 0 && p.X < sizeX &&
-            p.Y >= 0 && p.Y < sizeY &&
-            p.Z >= 0 && p.Z < sizeZ;
+        return (getTile(p) != null);
     }
 
     bool Walkable(Vector3I p)
     {
-        return InBounds(p) && !world[p.X, p.Y, p.Z].Solid;
+        if (!InBounds(p))
+            return false;
+
+        // ❌ case occupée
+        if (IsSolid(p))
+            return false;
+
+        // ✅ sol obligatoire juste en dessous
+        if (p.Y == 0)
+            return true;
+
+        return IsSolid(p + new Vector3I(0, -1, 0));
+
     }
 
     public List<Vector3I> FindPath(Vector3I start, Vector3I end)
@@ -74,12 +84,62 @@ public class Pathfinder
 
             foreach (var dir in directions)
             {
-                var nextPos = current.Pos + dir;
+                var basePos = current.Pos + dir;
+                Vector3I? validPos = null;
 
-                if (!Walkable(nextPos))
+                // 🟢 1. déplacement normal
+                if (Walkable(basePos))
+                {
+                    validPos = basePos;
+                }
+                else
+                {
+                    // 🔼 2. monter (step up)
+                    var up = new Vector3I(basePos.X, basePos.Y + 1, basePos.Z);
+
+                    bool canStepUp = Walkable(up) &&
+                    // ❌ bloc au-dessus de la tête actuelle
+                    !IsSolid(new Vector3I(current.Pos.X, current.Pos.Y + 1, current.Pos.Z)) &&
+
+                    // ❌ bloc au-dessus de la destination
+                    !IsSolid(new Vector3I(up.X, up.Y + 1, up.Z));
+
+                    if (canStepUp)
+                    {
+                        validPos = up;
+                    }
+                    else
+                    {
+                        // 🔽 3. descendre (step down)
+                        var down = new Vector3I(basePos.X, basePos.Y - 1, basePos.Z);
+
+                        bool canStepDown = Walkable(down) &&
+                        // ❌ bloc au-dessus pendant la descente
+                        !IsSolid(new Vector3I(basePos.X, basePos.Y + 1, basePos.Z));
+
+                        if (canStepDown)
+                        {
+                            validPos = down;
+                        }
+                    }
+                }
+
+                if (validPos == null)
                     continue;
 
-                int newG = current.G + 1;
+                var nextPos = validPos.Value;
+
+                // 🟨 coût de déplacement
+                int cost = 1;
+
+                // monter = plus cher
+                if (nextPos.Y > current.Pos.Y)
+                    cost = 2;
+
+                if (isOccupied != null && isOccupied(nextPos))
+                    cost += 10;
+
+                int newG = current.G + cost;
 
                 if (visited.TryGetValue(nextPos, out var existing))
                 {
@@ -97,10 +157,13 @@ public class Pathfinder
 
                 visited[nextPos] = node;
                 open.Enqueue(node, node.F);
+
+                // 🔍 DEBUG (optionnel)
+                // GD.Print("FROM ", current.Pos, " TO ", nextPos);
             }
         }
 
-        return null;
+        return null; // aucun chemin trouvé
     }
 
     List<Vector3I> Reconstruct(Node node)
@@ -115,5 +178,47 @@ public class Pathfinder
 
         path.Reverse();
         return path;
+    }
+
+/// <summary>
+/// Checks if a position is walkable by a colonist.
+/// </summary>
+/// <param name="p">The position to check.</param>
+/// <returns>true if the position is walkable, false otherwise.</returns>
+    public bool IsWalkable(Vector3I p)
+    {
+        return Walkable(p);
+    }
+
+
+    public List<Vector3I> SmoothPath(List<Vector3I> path)
+    {
+        if (path == null || path.Count < 3)
+            return path;
+
+        var result = new List<Vector3I>();
+        result.Add(path[0]);
+
+        for (int i = 1; i < path.Count - 1; i++)
+        {
+            var prev = path[i - 1];
+            var curr = path[i];
+            var next = path[i + 1];
+
+            if ((next - curr) != (curr - prev))
+                result.Add(curr);
+        }
+
+        result.Add(path[^1]);
+
+        return result;
+    }
+
+    bool IsSolid(Vector3I p)
+    {
+        if (!InBounds(p))
+            return false;
+
+        return getTile(p).Solid;
     }
 }

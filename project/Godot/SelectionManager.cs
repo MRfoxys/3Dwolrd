@@ -73,10 +73,10 @@ public class SelectionManager
         else
         {
             // 🔥 CLICK → raycast monde
-            Vector3 worldPos = GetMouseWorldPosition();
+            Vector3 worldPos = GetMouseGridPosition();
 
             Colonist closest = null;
-            float bestDist = 2f;
+            float bestDist = 1.2f;
 
             foreach (var pair in visuals)
             {
@@ -102,7 +102,7 @@ public class SelectionManager
         GD.Print("Selected count: ", SelectedColonists.Count);
     }
 
-    Vector3 GetMouseWorldPosition()
+    Vector3I GetMouseGridPosition()
     {
         var mousePos = camera.GetViewport().GetMousePosition();
 
@@ -115,9 +115,23 @@ public class SelectionManager
         var result = space.IntersectRay(query);
 
         if (result.Count > 0)
-            return (Vector3)result["position"];
+        {
+            var pos = (Vector3)result["position"];
+            var normal = (Vector3)result["normal"];
 
-        return Vector3.Zero;
+            int x = Mathf.FloorToInt(pos.X);
+            int y = Mathf.FloorToInt(pos.Y);
+            int z = Mathf.FloorToInt(pos.Z);
+
+            // clic sur surface → on va au dessus
+            if (normal.Y > 0.5f)
+                y += 1;
+
+            return new Vector3I(x, y, z);
+        }
+
+
+        return new Vector3I(0, 0, 0);
     }
 
     public Rect2 GetScreenRect()
