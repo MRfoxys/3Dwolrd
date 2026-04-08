@@ -64,6 +64,9 @@ public class Pathfinder
     {
         var open = new PriorityQueue<Node, int>();
         var visited = new Dictionary<Vector3I, Node>();
+        int maxIterations = 5000;
+        int iterations = 0;
+        var closed = new HashSet<Vector3I>();
 
         var startNode = new Node
         {
@@ -77,7 +80,20 @@ public class Pathfinder
 
         while (open.Count > 0)
         {
+            iterations++;
+
+            if (iterations > maxIterations)
+            {
+                GD.Print("❌ A* STOP (trop long)");
+                return null;
+            }
             var current = open.Dequeue();
+
+
+            if (closed.Contains(current.Pos))
+                continue;
+
+            closed.Add(current.Pos);
 
             if (current.Pos == end)
                 return Reconstruct(current);

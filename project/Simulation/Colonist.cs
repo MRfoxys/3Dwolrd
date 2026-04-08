@@ -7,6 +7,8 @@ public class Colonist
     public int X;
     public int Y;
     public int Z;
+
+    public Vector3I Position => new Vector3I(X, Y, Z);
     public int WaitTimer = 0;
 
     public Vector3I Target;

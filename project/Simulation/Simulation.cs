@@ -7,6 +7,8 @@ public class Simulation
     public int Tick;
     public World World;
 
+    public PlayerVision Vision = new PlayerVision();
+
     Pathfinder pathfinder;
 
     public Queue<PlayerCommand> CommandQueue = new();
@@ -31,9 +33,16 @@ public class Simulation
             ApplyCommand(cmd);
         }
 
+
+        Vision.ClearVisible();
+
         // déplacement des colons
         foreach (var colon in World.CurrentMap.Colonists)
         {
+             if (colon.OwnerId != 0) // joueur local
+                continue;
+
+            UpdateVision(colon);
             UpdateColon(colon);
         }
 
@@ -263,6 +272,76 @@ public class Simulation
         }
 
         return target;
+    }
+
+
+    void UpdateVision(Colonist colon)
+    {
+        int radius = 8;
+
+        for (int x = -radius; x <= radius; x++)
+        for (int y = -3; y <= 3; y++)
+        for (int z = -radius; z <= radius; z++)
+        {
+            var offset = new Vector3I(x, y, z);
+
+            // 🔥 distance sphérique
+            if (x*x + z*z > radius * radius)
+                continue;
+
+            var target = colon.Position + offset;
+
+            if (HasLineOfSight(colon.Position, target))
+            {
+                Vision.AddVisible(target);
+            }
+        }
+    }
+
+    bool HasLineOfSight(Vector3I from, Vector3I to)
+    {
+        var dir = to - from;
+
+        int ax = Mathf.Abs(dir.X);
+        int ay = Mathf.Abs(dir.Y);
+        int az = Mathf.Abs(dir.Z);
+
+        int steps = Mathf.Max(Mathf.Max(ax, ay), az);
+
+        if (steps == 0)
+            return true;
+
+        float dx = dir.X / (float)steps;
+        float dy = dir.Y / (float)steps;
+        float dz = dir.Z / (float)steps;
+
+        float x = from.X;
+        float y = from.Y;
+        float z = from.Z;
+
+        for (int i = 0; i < steps; i++)
+        {
+            x += dx;
+            y += dy;
+            z += dz;
+
+            var pos = new Vector3I(
+                Mathf.RoundToInt(x),
+                Mathf.RoundToInt(y),
+                Mathf.RoundToInt(z)
+            );
+
+            // 🔥 ignore la case finale
+            if (pos == to)
+                return true;
+
+            var tile = World.CurrentMap.GetTile(pos);
+
+            if (tile != null && tile.Solid)
+                return false; // 🚧 mur bloque vision
+        }
+
+        return true;
     }
 
 }
