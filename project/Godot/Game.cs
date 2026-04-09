@@ -1,10 +1,15 @@
 using Godot;
 using System.Collections.Generic;
+using System.Diagnostics;
 
 public partial class Game : Node3D
 {
+    const int CHUNK_REFRESH_INTERVAL_TICKS = 1;
+    const int CHUNK_VISIBILITY_INTERVAL_TICKS = 1;
+
     Simulation sim = new Simulation();
     LockstepManager lockstep = new LockstepManager();
+    SimulationFacade simFacade;
 
     CameraController cameraController;
     SelectionManager selectionManager;
@@ -30,12 +35,18 @@ public partial class Game : Node3D
     Dictionary<Vector3I, Node3D> spawnedTiles = new();
 
     int chunkRadius = 2;
+    int chunkPreloadMargin = 1;
     bool debugChunks = false;
 
     HashSet<Vector3I> currentNeededChunks = new();
 
     Vector3I lastPlayerChunk = new Vector3I(int.MinValue, int.MinValue, int.MinValue);
     Dictionary<Vector3I, MultiMeshInstance3D> chunkMeshes = new();
+    int lastChunkRefreshTick = -1;
+    int lastChunkVisibilityTick = -1;
+    long lastChunkRefreshMicroseconds = 0;
+    int lastNeededChunkCount = 0;
+    float lastFrameDeltaSeconds = 0f;
 
     public override void _Ready()
     {
@@ -51,6 +62,7 @@ public partial class Game : Node3D
         selectionRect = GetNode<ColorRect>("UI/SelectionRect");
 
         InitSimulation();
+        simFacade = new SimulationFacade(sim, lockstep);
         SpawnVisuals();
         spawnedTiles.Clear();
         //SpawnTiles();replace by updatechunks
@@ -58,7 +70,7 @@ public partial class Game : Node3D
 
         cameraController = new CameraController(cameraPivot, camera);
         selectionManager = new SelectionManager(camera, colonVisuals, localPlayerId);
-        unitController = new UnitController(sim, lockstep, camera);
+        unitController = new UnitController(sim, lockstep, camera, GetNode<Node>("UI"));
     }
 
     public override void _Process(double delta)
@@ -66,20 +78,35 @@ public partial class Game : Node3D
         if (sim.World == null)
             return;
 
+        lastFrameDeltaSeconds = (float)delta;
         accumulator += delta;
 
+        bool tickAdvanced = false;
         while (accumulator >= TICK_RATE)
         {
             Step();
             accumulator -= TICK_RATE;
+            tickAdvanced = true;
         }
 
         UpdateSelectionRect();
 
 
-        UpdateChunksAroundColonists();
-        UnloadFarChunks();
-        UpdateChunkVisibility();
+        if (ShouldRefreshChunks(tickAdvanced))
+        {
+            var sw = Stopwatch.StartNew();
+            UpdateChunksAroundColonists();
+            UnloadFarChunks();
+            lastChunkRefreshTick = sim.Tick;
+            sw.Stop();
+            lastChunkRefreshMicroseconds = (long)(sw.ElapsedTicks * (1_000_000.0 / Stopwatch.Frequency));
+            lastNeededChunkCount = currentNeededChunks.Count;
+        }
+        if (tickAdvanced && sim.Tick % CHUNK_VISIBILITY_INTERVAL_TICKS == 0 && sim.Tick != lastChunkVisibilityTick)
+        {
+            UpdateChunkVisibility();
+            lastChunkVisibilityTick = sim.Tick;
+        }
         
 
         Render();
@@ -88,6 +115,10 @@ public partial class Game : Node3D
 
     public override void _Input(InputEvent @event)
     {
+        // Godot can dispatch input before _Ready has fully wired controllers.
+        if (cameraController == null || selectionManager == null || unitController == null)
+            return;
+
         cameraController.HandleInput(@event);
         selectionManager.HandleInput(@event);
         unitController.HandleInput(@event, selectionManager.SelectedColonists);
@@ -125,17 +156,23 @@ public partial class Game : Node3D
                         mat.AlbedoColor = baseColor;
                 }
             }
+
+            if (key.Keycode == Key.F10)
+            {
+                var m = sim.LastPathMetrics;
+                GD.Print($"PATH METRICS req={m.Requests} hit={m.CacheHits} fail={m.Failures} us={m.TotalMicroseconds}");
+            }
+
+            if (key.Keycode == Key.F11)
+            {
+                GD.Print($"CHUNK METRICS active={chunkMeshes.Count} needed={lastNeededChunkCount} last_us={lastChunkRefreshMicroseconds}");
+            }
         }
     }
 
     void Step()
     {
-        var cmds = lockstep.GetCommandsForTick(sim.Tick);
-
-        foreach (var cmd in cmds)
-            sim.CommandQueue.Enqueue(cmd);
-
-        sim.Update();
+        simFacade.Step();
     }
 
     void Render()
@@ -145,7 +182,16 @@ public partial class Game : Node3D
             var colon = pair.Key;
             var node = pair.Value;
 
-            var targetPos = new Vector3(colon.X, colon.Y, colon.Z);
+            var currentPos = new Vector3(colon.X, colon.Y, colon.Z);
+            var renderPos = currentPos;
+
+            if (colon.Path != null && colon.Path.Count > 0)
+            {
+                var next = colon.Path[0];
+                var nextPos = new Vector3(next.X, next.Y, next.Z);
+                renderPos = currentPos.Lerp(nextPos, Mathf.Clamp(colon.MoveProgress, 0f, 1f));
+            }
+
             var mesh = node.GetNode<MeshInstance3D>("MeshInstance3D");
 
             // 🎯 sélection
@@ -168,8 +214,9 @@ public partial class Game : Node3D
 
             node.Visible = true;
 
-            // 🎥 interpolation fluide
-            node.Position = node.Position.Lerp(targetPos, 0.2f);
+            // Smooth visual update to avoid jitter when many move commands arrive quickly.
+            float maxStep = colon.MoveSpeed * lastFrameDeltaSeconds;
+            node.Position = node.Position.MoveToward(renderPos, maxStep);
         }
     }
 
@@ -188,64 +235,34 @@ public partial class Game : Node3D
 
     void InitSimulation()
     {
-        sim.World = new World();
+        var bootstrap = new WorldBootstrap();
+        sim.World = bootstrap.CreateDefaultWorld(chunkRadius, localPlayerId);
+        sim.Init();
+    }
 
-        var map = new Map();
-        var chunk = new Chunk();
+    bool ShouldRefreshChunks(bool tickAdvanced)
+    {
+        if (!tickAdvanced)
+            return false;
 
+        if (sim.Tick == lastChunkRefreshTick)
+            return false;
 
-        // sol
-        for (int x = 0; x < 16; x++)
-        for (int z = 0; z < 16; z++)
+        var map = sim.World.CurrentMap;
+        foreach (var colon in map.Colonists)
         {
-            chunk.Tiles[x, 0, z] = new Tile { Solid = true, Type = "ground" };
-        }
-
-        // plateforme
-        for (int x = 4; x < 8; x++)
-        for (int z = 4; z < 8; z++)
-        {
-            chunk.Tiles[x, 2, z] = new Tile { Solid = true, Type = "platform" };
-        }
-
-        // escalier simple
-        chunk.Tiles[4, 1, 4] = new Tile { Solid = true, Type = "stairs" };
-
-        map.Chunks[new Vector3I(0, 0, 0)] = chunk;
-
-        int radius = 2; // nombre de chunks autour
-
-        for (int cx = -radius; cx <= radius; cx++)
-        for (int cz = -radius; cz <= radius; cz++)
-        {
-            var pos = new Vector3I(cx, 0, cz);
-
-            // ⚠️ skip ton chunk custom
-            if (pos == new Vector3I(0, 0, 0))
+            if (colon.OwnerId != localPlayerId)
                 continue;
 
-            var generated = map.GenerateFlatChunk(pos);
-            map.Chunks[pos] = generated;
-        }
-        
-        // colons
-        for (int i = 0; i < 5; i++)
-        {
-            var colon = new Colonist
+            var chunk = WorldToChunk(new Vector3(colon.X, colon.Y, colon.Z));
+            if (chunk != lastPlayerChunk)
             {
-                X = 5 + i,
-                Y = 1,
-                Z = 2,
-                OwnerId = 0
-            };
-
-            map.Colonists.Add(colon);
+                lastPlayerChunk = chunk;
+                return true;
+            }
         }
 
-        sim.World.Maps.Add(map);
-        sim.World.CurrentMap = map;
-
-        sim.Init();
+        return sim.Tick % CHUNK_REFRESH_INTERVAL_TICKS == 0;
     }
 
     void SpawnTiles()
@@ -480,6 +497,7 @@ public partial class Game : Node3D
             "ground" => new Color(0.4f, 0.25f, 0.1f),
             "platform" => new Color(1.0f, 0.5f, 0.0f),
             "stairs" => new Color(0.8f, 0.8f, 0.2f),
+            "tree" => new Color(0.05f, 0.35f, 0.08f),
             _ => new Color(1, 1, 1)
         };
     }
@@ -534,8 +552,6 @@ public partial class Game : Node3D
 
         HashSet<Vector3I> neededChunks = new();
 
-        bool useVision = sim.Vision.Visible.Count > 0;
-
         foreach (var colon in map.Colonists)
         {
 
@@ -544,26 +560,20 @@ public partial class Game : Node3D
 
             var colonChunk = WorldToChunk(new Vector3(colon.X, colon.Y, colon.Z));
 
-            for (int x = -chunkRadius; x <= chunkRadius; x++)
-            for (int z = -chunkRadius; z <= chunkRadius; z++)
+            int effectiveRadius = chunkRadius + chunkPreloadMargin;
+            int radiusSq = effectiveRadius * effectiveRadius;
+            for (int x = -effectiveRadius; x <= effectiveRadius; x++)
+            for (int z = -effectiveRadius; z <= effectiveRadius; z++)
             {
+                if (x * x + z * z > radiusSq)
+                    continue;
+
                 var chunkPos = new Vector3I
                 (
                     colonChunk.X + x,
                     0,
                     colonChunk.Z + z
                 );
-
-                // 🔥 centre du chunk
-                var chunkCenter = new Vector3I
-                (
-                    chunkPos.X * Map.CHUNK_SIZE + Map.CHUNK_SIZE / 2,
-                    1,
-                    chunkPos.Z * Map.CHUNK_SIZE + Map.CHUNK_SIZE / 2
-                );
-
-            if (useVision && !sim.Vision.IsVisible(chunkCenter))
-                continue;
 
                 neededChunks.Add(chunkPos);
 
@@ -617,17 +627,7 @@ public partial class Game : Node3D
         {
             var chunkPos = pair.Key;
             var instance = pair.Value;
-
-            var center = new Vector3I(
-                chunkPos.X * Map.CHUNK_SIZE + Map.CHUNK_SIZE / 2,
-                1,
-                chunkPos.Z * Map.CHUNK_SIZE + Map.CHUNK_SIZE / 2
-            );
-
-            bool discovered = sim.Vision.IsDiscovered(center);
-            bool visible = sim.Vision.IsVisible(center);
-            bool inCamera = IsInCameraView(center);
-
+            EvaluateChunkFog(chunkPos, out bool discovered, out bool visible);
             if (!discovered)
             {
                 instance.Visible = false;
@@ -641,10 +641,43 @@ public partial class Game : Node3D
             if (mat == null)
                 continue;
 
-            if (!visible || !inCamera)
+            if (!visible)
                 mat.AlbedoColor = new Color(0.2f, 0.2f, 0.2f);
             else
                 mat.AlbedoColor = new Color(1, 1, 1);
+        }
+    }
+
+    void EvaluateChunkFog(Vector3I chunkPos, out bool discovered, out bool visible)
+    {
+        discovered = false;
+        visible = false;
+
+        int startX = chunkPos.X * Map.CHUNK_SIZE;
+        int startZ = chunkPos.Z * Map.CHUNK_SIZE;
+        int endX = startX + Map.CHUNK_SIZE - 1;
+        int endZ = startZ + Map.CHUNK_SIZE - 1;
+        int midX = startX + Map.CHUNK_SIZE / 2;
+        int midZ = startZ + Map.CHUNK_SIZE / 2;
+
+        Vector3I[] samples = new Vector3I[]
+        {
+            new(startX, 1, startZ),
+            new(endX, 1, startZ),
+            new(startX, 1, endZ),
+            new(endX, 1, endZ),
+            new(midX, 1, midZ),
+        };
+
+        foreach (var sample in samples)
+        {
+            if (sim.Vision.IsDiscovered(sample))
+                discovered = true;
+            if (sim.Vision.IsVisible(sample))
+                visible = true;
+
+            if (discovered && visible)
+                return;
         }
     }
 

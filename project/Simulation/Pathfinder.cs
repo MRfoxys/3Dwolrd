@@ -4,7 +4,6 @@ using Godot;
 
 public class Pathfinder
 {
-    int sizeX, sizeY, sizeZ;
     Func<Vector3I, bool> isOccupied;
     Func<Vector3I, Tile> getTile;
 
@@ -84,7 +83,6 @@ public class Pathfinder
 
             if (iterations > maxIterations)
             {
-                GD.Print("❌ A* STOP (trop long)");
                 return null;
             }
             var current = open.Dequeue();
@@ -145,15 +143,17 @@ public class Pathfinder
 
                 var nextPos = validPos.Value;
 
+                // Occupied cells are treated as blocked to avoid unstable detours
+                // and "zigzag" replanning around moving units.
+                if (isOccupied != null && isOccupied(nextPos))
+                    continue;
+
                 // 🟨 coût de déplacement
                 int cost = 1;
 
                 // monter = plus cher
                 if (nextPos.Y > current.Pos.Y)
                     cost = 2;
-
-                if (isOccupied != null && isOccupied(nextPos))
-                    cost += 10;
 
                 int newG = current.G + cost;
 

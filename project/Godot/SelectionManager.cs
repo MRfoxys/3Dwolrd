@@ -3,13 +3,16 @@ using System.Collections.Generic;
 
 public class SelectionManager
 {
+    const float DRAG_THRESHOLD_PIXELS = 12f;
+
     Camera3D camera;
     Dictionary<Colonist, Node3D> visuals;
     int localPlayerId;
 
     public List<Colonist> SelectedColonists = new();
+    bool leftPressed = false;
     bool dragging = false;
-    public bool IsDragging => dragging;
+    public bool IsDragging => dragging && leftPressed;
     Vector2 start;
     Vector2 end;
 
@@ -28,22 +31,27 @@ public class SelectionManager
             {
                 if (mouse.Pressed)
                 {
-                    dragging = true;
+                    leftPressed = true;
+                    dragging = false;
                     start = mouse.Position;
+                    end = mouse.Position;
                 }
                 else
                 {
-                    dragging = false;
+                    leftPressed = false;
                     end = mouse.Position;
 
                     Select();
+                    dragging = false;
                 }
             }
         }
 
-        if (@event is InputEventMouseMotion motion && dragging)
+        if (@event is InputEventMouseMotion motion && leftPressed)
         {
             end = motion.Position;
+            if (!dragging && start.DistanceTo(end) >= DRAG_THRESHOLD_PIXELS)
+                dragging = true;
         }
     }
 
@@ -54,7 +62,7 @@ public class SelectionManager
         var rect = new Rect2(start, end - start).Abs();
 
         // 🟦 DRAG
-        if (rect.Size.Length() > 10)
+        if (dragging)
         {
             foreach (var pair in visuals)
             {

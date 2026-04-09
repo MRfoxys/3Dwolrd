@@ -4,14 +4,23 @@ using System;
 
 public class Simulation
 {
+    const float TICK_DURATION_SECONDS = 0.05f;
     public int Tick;
     public World World;
 
     public PlayerVision Vision = new PlayerVision();
 
     Pathfinder pathfinder;
+    readonly PathRequestService pathRequestService = new PathRequestService();
+    JobBoard jobBoard;
+    readonly List<IWorkGiver> workGivers = new() { new WorkGiverCutTree() };
+
+    public bool EnableDebugLogs = false;
+    public PathMetrics LastPathMetrics => pathRequestService.LastMetrics;
 
     public Queue<PlayerCommand> CommandQueue = new();
+
+    public IReadOnlyList<Colonist> Colonists => World.CurrentMap.Colonists;
 
     public void Init()
     {
@@ -20,18 +29,17 @@ public class Simulation
             (pos) => map.GetTile(pos),
             (pos) => IsOccupied(pos) // 🔥 injection propre
         );
+        pathRequestService.Bind(pathfinder);
+        jobBoard = new JobBoard();
+        foreach (var giver in workGivers)
+            giver.Bootstrap(map, jobBoard);
     }
 
     public void Update()
     {
         Tick++;
 
-        // commandes joueur
-        while (CommandQueue.Count > 0)
-        {
-            var cmd = CommandQueue.Dequeue();
-            ApplyCommand(cmd);
-        }
+        ProcessCommandQueue();
 
 
         Vision.ClearVisible();
@@ -48,6 +56,35 @@ public class Simulation
 
     }
 
+    void ProcessCommandQueue()
+    {
+        var latestMoveByEntity = new Dictionary<int, PlayerCommand>();
+        var immediateCommands = new List<PlayerCommand>();
+
+        while (CommandQueue.Count > 0)
+        {
+            var cmd = CommandQueue.Dequeue();
+            if (cmd.Type == "MOVE")
+            {
+                latestMoveByEntity[cmd.EntityId] = cmd;
+                continue;
+            }
+
+            immediateCommands.Add(cmd);
+        }
+
+        foreach (var cmd in immediateCommands)
+            ApplyCommand(cmd);
+
+        foreach (var cmd in latestMoveByEntity.Values)
+            ApplyCommand(cmd);
+    }
+
+    public int GetColonistIndex(Colonist colon)
+    {
+        return World.CurrentMap.Colonists.IndexOf(colon);
+    }
+
     void ApplyCommand(PlayerCommand cmd)
     {
         if (cmd.Type == "MOVE")
@@ -62,40 +99,45 @@ public class Simulation
             //trouve une case libre
             var end = FindNearestFreeWithReservation(rawTarget, reserved);
 
+            if (end == start)
+            {
+                colon.Path = null;
+                colon.MoveProgress = 0f;
+                return;
+            }
+
             if (!pathfinder.IsWalkable(end))
             {
-                GD.Print("❌ TARGET NON WALKABLE");
+                LogDebug("TARGET NON WALKABLE");
                 return;
             }
 
             reserved.Add(end);
             colon.Target = end;
-            GD.Print("=== APPLY COMMAND ===");
-
-            var path = pathfinder.FindPath(start, end);
+            var path = pathRequestService.GetOrCreatePath(start, end);
 
             if (path == null)
             {
-                GD.Print("❌ PATH NULL");
                 colon.HasPathFailed = true;
                 colon.Path = null;
+                colon.MoveProgress = 0f;
                 return;
             }
             if ( path.Count <= 1)
             {
-                GD.Print("❌ PATH INUTILISABLE");
                 colon.HasPathFailed = true;
                 colon.Path = null;
+                colon.MoveProgress = 0f;
                 return;
             }
 
-            path = pathfinder.SmoothPath(path);
+            path = pathfinder.SmoothPath(new List<Vector3I>(path));
 
             if (path == null || path.Count <= 1)
             {
-                GD.Print("❌ PATH INUTILISABLE");
                 colon.HasPathFailed = true;
                 colon.Path = null;
+                colon.MoveProgress = 0f;
                 return;
             }
 
@@ -105,89 +147,53 @@ public class Simulation
             colon.Path = path;
             colon.HasPathFailed = false;
             colon.Target = end;
-
-            GD.Print("✅ PATH OK: ", path.Count);
-
-
-//debug part
-            var below = World.CurrentMap.GetTile(new Vector3I(end.X, end.Y - 1, end.Z));
-            var current = World.CurrentMap.GetTile(end);
-
-            GD.Print("TARGET: ", end);
-            GD.Print("BELOW SOLID: ", below.Solid);
-            GD.Print("CURRENT SOLID: ", current.Solid);
-            if (path == null)
-            {
-                GD.Print("❌ PATH = NULL");
-                return;
-            }
-
-            if (path.Count <= 1)
-            {
-                GD.Print("❌ PATH TROP COURT");
-                return;
-            }
-			GD.Print("MOVE reçu pour entity ", cmd.EntityId);
-            GD.Print("TARGET: ", end);
-            GD.Print("PATH COUNT: ", path?.Count ?? 0);
-            GD.Print("START: ", start);
-            GD.Print("END: ", end);
-
-            var tile = World.CurrentMap.GetTile(end);
-            GD.Print("END TILE SOLID: ", tile.Solid);
+            colon.MoveProgress = 0f;
+            LogDebug($"PATH OK: {path.Count} (from {start} to {end})");
         }
     }
 
     void UpdateColon(Colonist colon)
     {
-        if (colon.RepathTimer > 5)
-        {
-            var start = new Vector3I(colon.X, colon.Y, colon.Z);
-
-            var newPath = pathfinder.FindPath(start, colon.Target);
-
-            if (newPath == null || newPath.Count <= 1)
-            {
-                colon.HasPathFailed = true;
-                colon.Path = null;
-                return; // 🔥 STOP
-            }
-
-            if (newPath != null && newPath.Count > 1)
-            {
-                newPath.RemoveAt(0);
-                colon.Path = newPath;
-                colon.HasPathFailed = false;
-            }
-            else
-            {
-                GD.Print("❌ REPATH IMPOSSIBLE → STOP");
-                colon.HasPathFailed = true;
-                colon.Path = null;
-                return; // 🔥 STOP HARD
-            }
-
-            colon.RepathTimer = 0;
-        }
-
         if (colon.HasPathFailed)
             return;
 
+        if ((colon.Path == null || colon.Path.Count == 0) && colon.ActiveJob == null)
+            TryAssignJob(colon);
+
         if (colon.Path == null || colon.Path.Count == 0)
+        {
+            colon.MoveProgress = 0f;
+            TryExecuteWork(colon);
             return;
+        }
 
         var next = colon.Path[0];
 
         // blocage
         if (!pathfinder.IsWalkable(next) || IsOccupied(next, colon))
         {
+            var start = new Vector3I(colon.X, colon.Y, colon.Z);
+            var newPath = pathRequestService.GetOrCreatePath(start, colon.Target);
+            if (newPath != null && newPath.Count > 1)
+            {
+                newPath = pathfinder.SmoothPath(new List<Vector3I>(newPath));
+                if (newPath != null && newPath.Count > 1)
+                {
+                    newPath.RemoveAt(0);
+                    colon.Path = newPath;
+                    colon.MoveProgress = 0f;
+                    return;
+                }
+            }
+
             colon.Path = null;
             colon.HasPathFailed = true;
+            colon.MoveProgress = 0f;
             return;
         }
 
-        // 🔥 progression fluide
-        colon.MoveProgress += 0.2f; // vitesse (ajuste ici)
+        // Constant tile movement speed (tiles/sec) independent from render interpolation.
+        colon.MoveProgress += colon.MoveSpeed * TICK_DURATION_SECONDS;
 
         if (colon.MoveProgress >= 1f)
         {
@@ -198,6 +204,66 @@ public class Simulation
             colon.Path.RemoveAt(0);
             colon.MoveProgress = 0f;
         }
+    }
+
+    void TryAssignJob(Colonist colon)
+    {
+        int colonistId = GetColonistIndex(colon);
+        if (colonistId < 0 || !jobBoard.TryReserveBest(colonistId, colon.Position, out var job))
+            return;
+
+        var workPos = FindNearestFree(job.Target);
+        if (!pathfinder.IsWalkable(workPos))
+        {
+            jobBoard.Fail(job);
+            return;
+        }
+
+        var start = colon.Position;
+        var path = pathRequestService.GetOrCreatePath(start, workPos);
+        if (path == null || path.Count <= 1)
+        {
+            jobBoard.Fail(job);
+            return;
+        }
+
+        path = pathfinder.SmoothPath(new List<Vector3I>(path));
+        if (path == null || path.Count <= 1)
+        {
+            jobBoard.Fail(job);
+            return;
+        }
+
+        path.RemoveAt(0);
+        job.WorkPosition = workPos;
+        colon.ActiveJob = job;
+        colon.Path = path;
+        colon.Target = workPos;
+        colon.MoveProgress = 0f;
+        colon.WorkTicksRemaining = 10;
+    }
+
+    void TryExecuteWork(Colonist colon)
+    {
+        var job = colon.ActiveJob;
+        if (job == null)
+            return;
+
+        if (colon.Position != job.WorkPosition)
+            return;
+
+        colon.WorkTicksRemaining--;
+        if (colon.WorkTicksRemaining > 0)
+            return;
+
+        if (job.Type == JobType.CutTree)
+        {
+            World.CurrentMap.SetTile(job.Target, new Tile { Solid = false, Type = "air" });
+        }
+
+        jobBoard.Complete(job);
+        colon.ActiveJob = null;
+        colon.WorkTicksRemaining = 0;
     }
 
     Vector3I FindNearestFree(Vector3I target)
@@ -344,4 +410,11 @@ public class Simulation
         return true;
     }
 
+    void LogDebug(string message)
+    {
+        if (!EnableDebugLogs)
+            return;
+
+        GD.Print("[Simulation] ", message);
+    }
 }

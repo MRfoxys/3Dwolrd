@@ -15,10 +15,12 @@ public class Colonist
     public int RepathTimer = 0;
 
     public float MoveProgress = 0f;
-    public float MoveSpeed = 3f;
+    public float MoveSpeed = 6.0f;
+    public int WorkTicksRemaining = 0;
 
     public bool HasPathFailed = false;
     public List<Vector3I> Path = new();
+    public SimJob ActiveJob;
 
     public Colonist()
     {

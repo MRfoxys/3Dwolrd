@@ -25,6 +25,13 @@ public class Map
         return tile;
     }
 
+    public void SetTile(Vector3I worldPos, Tile tile)
+    {
+        var chunk = GetChunk(worldPos);
+        var local = WorldToLocal(worldPos);
+        chunk.Tiles[local.X, local.Y, local.Z] = tile;
+    }
+
     public bool HasTile(Vector3I pos)
     {
         return GetTile(pos) != null;

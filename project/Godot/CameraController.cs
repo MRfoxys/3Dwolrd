@@ -7,11 +7,22 @@ public class CameraController
 
     bool rotating = false;
     float speed = 10f;
+    float zoomStep = 2.5f;
+    float zoomSmooth = 12f;
+    float minZoom = 6f;
+    float maxZoom = 45f;
+    float targetZoom;
+    Vector3 zoomDirection;
 
     public CameraController(Node3D pivot , Camera3D camera)
     {
         this.pivot = pivot;
         this.camera = camera;
+
+        zoomDirection = camera.Position.Normalized();
+        if (zoomDirection == Vector3.Zero)
+            zoomDirection = new Vector3(0, 0.6f, 0.8f).Normalized();
+        targetZoom = Mathf.Clamp(camera.Position.Length(), minZoom, maxZoom);
     }
 
     public void Update(double delta)
@@ -45,6 +56,11 @@ public class CameraController
             move += Vector3.Down;
 
         pivot.Position += move * speed * (float)delta;
+
+        float currentZoom = camera.Position.Length();
+        float t = Mathf.Clamp((float)delta * zoomSmooth, 0f, 1f);
+        float smoothedZoom = Mathf.Lerp(currentZoom, targetZoom, t);
+        camera.Position = zoomDirection * smoothedZoom;
     }
 
     public void HandleInput(InputEvent @event)
@@ -54,10 +70,10 @@ public class CameraController
             if (mouse.ButtonIndex == MouseButton.Middle)
                 rotating = mouse.Pressed;
             if (mouse.ButtonIndex == MouseButton.WheelUp)
-                camera.Position += -camera.GlobalTransform.Basis.Z * 2;
+                targetZoom = Mathf.Clamp(targetZoom - zoomStep, minZoom, maxZoom);
 
             if (mouse.ButtonIndex == MouseButton.WheelDown)
-                camera.Position += camera.GlobalTransform.Basis.Z * 2;
+                targetZoom = Mathf.Clamp(targetZoom + zoomStep, minZoom, maxZoom);
         }
 
         if (@event is InputEventMouseMotion motion && rotating)

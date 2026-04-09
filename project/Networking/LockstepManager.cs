@@ -10,7 +10,21 @@ public class LockstepManager
         if (!Commands.ContainsKey(cmd.Tick))
             Commands[cmd.Tick] = new List<PlayerCommand>();
 
-        Commands[cmd.Tick].Add(cmd);
+        var bucket = Commands[cmd.Tick];
+
+        if (cmd.Type == "MOVE")
+        {
+            for (int i = 0; i < bucket.Count; i++)
+            {
+                if (bucket[i].Type == "MOVE" && bucket[i].EntityId == cmd.EntityId)
+                {
+                    bucket[i] = cmd;
+                    return;
+                }
+            }
+        }
+
+        bucket.Add(cmd);
     }
 
     public List<PlayerCommand> GetCommandsForTick(long tick)
