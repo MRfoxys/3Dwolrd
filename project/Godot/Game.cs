@@ -37,6 +37,13 @@ public partial class Game : Node3D
     [Export] public int ChunkLoadRadius = 2;
     /// <summary>Rayon supplémentaire (en chunks) autour des colons + pivot caméra pour éviter les trous quand la vue dépasse le colon.</summary>
     [Export] public int ChunkPreloadMargin = 1;
+    /// <summary>Couches de chunks au-dessus / en-dessous du colon et de la caméra (grottes, hauteur Y).</summary>
+    [Export] public int ChunkVerticalLoadMargin = 1;
+    /// <summary>À moins de N tuiles d’une face de chunk, précharge aussi la colonne de chunks voisine (vue au bord).</summary>
+    [Export] public int ChunkEdgePrefetchTiles = 8;
+    /// <summary>Rayon de la vision des colons en tuiles (sphère, LOS par tuile).</summary>
+    [Export(PropertyHint.Range, "4,40,1")]
+    public int ColonistVisionRadiusTiles = 12;
     bool debugChunks = false;
 
     [Export] public float TerrainOcclusionMaxCameraDistance = 50f;
@@ -49,13 +56,16 @@ public partial class Game : Node3D
     [Export] public bool TerrainPickUsePixelCenterRay = true;
     /// <summary>False = repli grille DDA uniquement (sans collision chunk). True = raycast calque terrain + repli DDA si échec ou Q/Alt (percée).</summary>
     [Export] public bool TerrainPickUsePhysicsRaycast = true;
+    // Coupe V : plan P vertical par la caméra (Cx,Cy,Cz), n = projection XZ du regard ; P' = P ± delta·n ; s = (bloc - C)·n.
     [ExportGroup("Coupe terrain (touche V)")]
-    /// <summary>Si true : inverse seulement la coupe verticale (gris ↔ marron). Le pelage sol n&apos;est pas inversé.</summary>
-    [Export] public bool VerticalSliceInvertVisibility = true;
+    /// <summary>Legacy: inverse seulement la coupe verticale. Laisser false pour la règle stricte &quot;derrière P&apos; = invisible&quot;.</summary>
+    [Export] public bool VerticalSliceInvertVisibility = false;
     [Export] public bool VerticalSliceUseVerticalCut = true;
-    /// <summary>True = masque derrière le regard (s&lt;0). False = masque devant (s&gt;0).</summary>
+    /// <summary>True = masquer le demi-espace &quot;derrière&quot; P&apos; (s &lt; -delta). False = masquer l&apos;autre côté (s &gt; +delta).</summary>
     [Export] public bool VerticalSliceHideBehindCameraSide = false;
-    /// <summary>≤0 (ex. -1) = pas de limite devant, seulement masquage derrière (s&lt;0). &gt;0 = au plus N tuiles visibles devant, au-delà masqué.</summary>
+    /// <summary>Décalage monde entre P et P&apos; le long de n. Masquage derrière : invisible si s &lt; -delta. Masquage devant : invisible si s &gt; +delta.</summary>
+    [Export] public float VerticalSliceClipPlaneDelta = 0f;
+    /// <summary>≤0 = pas de seconde limite le long de n. &gt;0 = masque aussi les blocs trop loin devant (mode derrière) ou trop loin derrière (mode devant).</summary>
     [Export] public float VerticalSliceForwardCutDepth = -1f;
     [Export] public bool VerticalSlicePeelGroundWhenCameraLow = true;
     /// <summary>Sous cette hauteur Y (monde), retire le sol / le plafond de voxels au-dessus de la caméra pour éviter de voir l&apos;intérieur des blocs en descendant.</summary>
@@ -68,6 +78,8 @@ public partial class Game : Node3D
     public float VerticalSliceScreenBottomHideFraction = 0f;
     /// <summary>True = approximation espace caméra (léger). False = Unproject par voxel (lourd si fraction &gt; 0).</summary>
     [Export] public bool VerticalSliceScreenBottomFastCameraApprox = true;
+    /// <summary>En coupe V, le pelage multimesh ne se recalcule que lorsque la caméra bouge d’environ ce pas (monde). Plus grand = moins de lag.</summary>
+    [Export] public float VerticalSlicePeelCameraBucketWorld = 14f;
 
     [ExportGroup("Sélection blocs")]
     [Export] public bool TerrainSelectionHighlightEnabled = true;
@@ -110,6 +122,16 @@ public partial class Game : Node3D
     readonly HashSet<Vector3I> _terrainOcclusionHiddenPrev = new();
     readonly List<Vector3I> _raySolidBuffer = new();
     readonly List<Vector3I> _raySolidPickBuffer = new();
+    ulong _verticalSliceEvalFrame = ulong.MaxValue;
+    Vector3 _verticalSliceEvalCamPos;
+    Vector3 _verticalSliceEvalForward;
+    Vector3 _verticalSliceEvalPlaneN;
+    bool _verticalSliceEvalPlaneNValid;
+    bool _verticalSliceEvalNeedScreenBottom;
+    float _verticalSliceEvalBottomFrac;
+    Transform3D _verticalSliceEvalInvCam;
+    float _verticalSliceEvalTanHalfFov;
+    float _verticalSliceEvalViewportHeight;
 
     Label _selectionModeLabel;
     Label _treeTargetLabel;
@@ -192,7 +214,8 @@ public partial class Game : Node3D
         cameraController = new CameraController(cameraPivot, camera);
         selectionManager = new SelectionManager(camera, colonVisuals, localPlayerId);
         selectionManager.TargetKind = _selectionTargetKind;
-        unitController = new UnitController(sim, lockstep, camera, GetNode<Node>("UI"));
+        unitController = new UnitController(sim, lockstep, camera, GetNode<Node>("UI"),
+            (out Vector3I anchor) => TryGetMoveOrderAnchorFromScreen(out anchor));
         UpdateSelectionTargetUi();
 
         sim.OnJobStarted   += OnJobStarted;
@@ -245,7 +268,8 @@ public partial class Game : Node3D
         cameraController.Update(delta);
         RefreshJobsQueueUi();
         RefreshTreeJobOverlays();
-        ApplyMultimeshOcclusionPeels();
+        if (_verticalSliceTerrainActive || _verticalSliceTerrainWasActive || _terrainOcclusionHidden.Count > 0)
+            ApplyMultimeshOcclusionPeels();
         ApplyTerrainSelectionHighlights();
         SyncTreeResourcesVisibilityWithOcclusion();
         RefreshMineStoneButtonState();
@@ -447,6 +471,7 @@ public partial class Game : Node3D
         var bootstrap = new WorldBootstrap();
         sim.World = bootstrap.CreateDefaultWorld(ChunkLoadRadius, localPlayerId);
         sim.Init();
+        sim.VisionRadiusTiles = ColonistVisionRadiusTiles;
     }
 
     bool ShouldRefreshChunks(bool tickAdvanced)
@@ -580,15 +605,9 @@ public partial class Game : Node3D
 
         _terrainPickVisibilityCacheToken = token;
         _terrainPickHiddenCache.Clear();
-        foreach (var pair in _chunkVisuals)
-        {
-            var cv = pair.Value;
-            foreach (var kv in cv.SolidInstanceByWorld)
-                _terrainPickHiddenCache[kv.Key] = IsTerrainCellPickHiddenRaw(kv.Key);
-        }
     }
 
-    /// <summary>Cellule masquée par la coupe V ou la percée Q — cache booléen aligné sur le token peel (pas de rebuild mesh).</summary>
+    /// <summary>Cellule masquée par la coupe V ou la percée Q — cache paresseux (ne parcourt plus tous les voxels à chaque frame).</summary>
     bool IsTerrainCellPickHidden(Vector3I cell)
     {
         if (!_verticalSliceTerrainActive && _terrainOcclusionHidden.Count == 0)
@@ -596,7 +615,9 @@ public partial class Game : Node3D
         RefreshTerrainPickVisibilityCacheIfNeeded();
         if (_terrainPickHiddenCache.TryGetValue(cell, out bool hidden))
             return hidden;
-        return IsTerrainCellPickHiddenRaw(cell);
+        hidden = IsTerrainCellPickHiddenRaw(cell);
+        _terrainPickHiddenCache[cell] = hidden;
+        return hidden;
     }
 
     bool IsTerrainFaceExposedForPick(Map map, Vector3I cell, Vector3I faceNormal)
@@ -818,12 +839,14 @@ public partial class Game : Node3D
     {
         var map = sim.World.CurrentMap;
 
+        int vy = Mathf.Max(0, ChunkVerticalLoadMargin);
         for (int x = -ChunkLoadRadius; x <= ChunkLoadRadius; x++)
+        for (int dy = -vy; dy <= vy; dy++)
         for (int z = -ChunkLoadRadius; z <= ChunkLoadRadius; z++)
         {
             var chunkPos = new Vector3I(
                 playerChunk.X + x,
-                0,
+                playerChunk.Y + dy,
                 playerChunk.Z + z
             );
 
@@ -974,12 +997,35 @@ public partial class Game : Node3D
         currentNeededChunks.Clear();
 
         int r = ChunkLoadRadius + Mathf.Max(0, ChunkPreloadMargin);
+        int vy = Mathf.Max(0, ChunkVerticalLoadMargin);
 
-        void AddColumnNeighborhoodXZ(int chunkX, int chunkZ)
+        void AddChunkColumnNeighborhood(int chunkX, int chunkY, int chunkZ)
         {
             for (int dx = -r; dx <= r; dx++)
+            for (int dy = -vy; dy <= vy; dy++)
             for (int dz = -r; dz <= r; dz++)
-                currentNeededChunks.Add(new Vector3I(chunkX + dx, 0, chunkZ + dz));
+                currentNeededChunks.Add(new Vector3I(chunkX + dx, chunkY + dy, chunkZ + dz));
+        }
+
+        void PrefetchNeighborChunkColumnsNearEdges(Vector3I world, int ox, int oy, int oz)
+        {
+            int m = ChunkEdgePrefetchTiles;
+            if (m <= 0)
+                return;
+            int s = Map.CHUNK_SIZE;
+            Vector3I loc = map.WorldToLocal(world);
+            if (loc.X < m)
+                AddChunkColumnNeighborhood(ox - 1, oy, oz);
+            if (loc.X >= s - m)
+                AddChunkColumnNeighborhood(ox + 1, oy, oz);
+            if (loc.Y < m)
+                AddChunkColumnNeighborhood(ox, oy - 1, oz);
+            if (loc.Y >= s - m)
+                AddChunkColumnNeighborhood(ox, oy + 1, oz);
+            if (loc.Z < m)
+                AddChunkColumnNeighborhood(ox, oy, oz - 1);
+            if (loc.Z >= s - m)
+                AddChunkColumnNeighborhood(ox, oy, oz + 1);
         }
 
         foreach (var colon in map.Colonists)
@@ -988,18 +1034,20 @@ public partial class Game : Node3D
                 continue;
 
             int ox = Mathf.FloorToInt((float)colon.Position.X / Map.CHUNK_SIZE);
+            int oy = Mathf.FloorToInt((float)colon.Position.Y / Map.CHUNK_SIZE);
             int oz = Mathf.FloorToInt((float)colon.Position.Z / Map.CHUNK_SIZE);
-            AddColumnNeighborhoodXZ(ox, oz);
+            AddChunkColumnNeighborhood(ox, oy, oz);
+            PrefetchNeighborChunkColumnsNearEdges(colon.Position, ox, oy, oz);
         }
 
-        // Même colonne Y=0 que la génération : le monde jouable tient dans un chunk vertical ;
-        // sans ça, avancer la caméra (WASD) vers le bord laisse un vide si le colon est plus loin.
+        // Pivot caméra : même logique XZ + hauteur Y pour éviter trous en grotte / étages.
         if (cameraPivot != null)
         {
             Vector3 gp = cameraPivot.GlobalPosition;
             int cx = Mathf.FloorToInt(gp.X / Map.CHUNK_SIZE);
+            int cy = Mathf.FloorToInt(gp.Y / Map.CHUNK_SIZE);
             int cz = Mathf.FloorToInt(gp.Z / Map.CHUNK_SIZE);
-            AddColumnNeighborhoodXZ(cx, cz);
+            AddChunkColumnNeighborhood(cx, cy, cz);
         }
 
         foreach (var chunkPos in currentNeededChunks)
@@ -1089,13 +1137,37 @@ public partial class Game : Node3D
         int midX = startX + Map.CHUNK_SIZE / 2;
         int midZ = startZ + Map.CHUNK_SIZE / 2;
 
-        int sy = Map.ColonistWalkY;
-        Vector3I[] samples = new Vector3I[]
+        int y0 = chunkPos.Y * Map.CHUNK_SIZE;
+        int y1 = y0 + Map.CHUNK_SIZE - 1;
+        int midY = y0 + Map.CHUNK_SIZE / 2;
+
+        // Chunk où se tient un colon local : toujours afficher (le fog utilisait Y=12 aux coins XZ,
+        // jamais marqués « discovered » alors que la grotte l’est → mesh entier invisible).
+        var map = sim.World.CurrentMap;
+        foreach (var c in map.Colonists)
         {
-            new(startX, sy, startZ),
-            new(endX, sy, startZ),
-            new(startX, sy, endZ),
-            new(endX, sy, endZ),
+            if (c.OwnerId != localPlayerId)
+                continue;
+            var cc = map.WorldToChunk(c.Position);
+            if (cc == chunkPos)
+            {
+                discovered = true;
+                visible = true;
+                return;
+            }
+        }
+
+        if (sim.Vision.ChunksWithDiscoveredTile.Contains(chunkPos))
+            discovered = true;
+
+        int sy = Mathf.Clamp(Map.ColonistWalkY, y0, y1);
+        Vector3I[] samples =
+        {
+            new(startX, midY, startZ),
+            new(endX, midY, startZ),
+            new(startX, midY, endZ),
+            new(endX, midY, endZ),
+            new(midX, midY, midZ),
             new(midX, sy, midZ),
         };
 
@@ -1168,8 +1240,8 @@ public partial class Game : Node3D
         {
             _selectionModeLabel.Text = _selectionTargetKind switch
             {
-                WorldSelectionTargetKind.Colonists => "Cible : Colons (clic / cadre)",
-                WorldSelectionTargetKind.Trees => "Cible : Arbres — clic sur un arbre",
+                WorldSelectionTargetKind.Colonists => "Cible : Colons (clic / cadre) — survol voxel comme blocs",
+                WorldSelectionTargetKind.Trees => "Cible : Arbres — même visée que blocs (coupe V, Q/Alt fond) · survol surligné",
                 WorldSelectionTargetKind.TerrainTiles => "Cible : Blocs — clic = 1 · Shift+clic = + · Q/Alt+clic = fond · V = coupe terrain",
                 _ => "Cible : —"
             };
@@ -1273,34 +1345,74 @@ public partial class Game : Node3D
         return _raySolidPickBuffer;
     }
 
+    void RefreshVerticalSliceEvalCache()
+    {
+        if (camera == null)
+            return;
+
+        ulong frame = Engine.GetProcessFrames();
+        if (frame == _verticalSliceEvalFrame)
+            return;
+        _verticalSliceEvalFrame = frame;
+
+        _verticalSliceEvalCamPos = camera.GlobalPosition;
+        _verticalSliceEvalForward = -camera.GlobalTransform.Basis.Z;
+
+        Vector3 n = new Vector3(_verticalSliceEvalForward.X, 0f, _verticalSliceEvalForward.Z);
+        if (n.LengthSquared() < 1e-8f)
+        {
+            _verticalSliceEvalPlaneN = Vector3.Right;
+            _verticalSliceEvalPlaneNValid = false;
+        }
+        else
+        {
+            _verticalSliceEvalPlaneN = n.Normalized();
+            _verticalSliceEvalPlaneNValid = true;
+        }
+
+        _verticalSliceEvalBottomFrac = Mathf.Clamp(VerticalSliceScreenBottomHideFraction, 0f, 1f);
+        _verticalSliceEvalNeedScreenBottom = _verticalSliceEvalBottomFrac > 1e-4f;
+        if (!_verticalSliceEvalNeedScreenBottom)
+            return;
+
+        if (VerticalSliceScreenBottomFastCameraApprox)
+        {
+            _verticalSliceEvalInvCam = camera.GlobalTransform.AffineInverse();
+            _verticalSliceEvalTanHalfFov = Mathf.Tan(Mathf.DegToRad(camera.Fov * 0.5f));
+        }
+        else
+        {
+            _verticalSliceEvalViewportHeight = GetViewport().GetVisibleRect().Size.Y;
+        }
+    }
+
     bool IsTerrainCellHiddenByVerticalSlice(Vector3I cell)
     {
         if (!_verticalSliceTerrainActive || camera == null)
             return false;
 
+        RefreshVerticalSliceEvalCache();
+
         Vector3 c = new Vector3(cell.X + 0.5f, cell.Y + 0.5f, cell.Z + 0.5f);
-        Vector3 camPos = camera.GlobalPosition;
+        Vector3 camPos = _verticalSliceEvalCamPos;
 
         bool hideVertical = false;
         if (VerticalSliceUseVerticalCut)
         {
-            Vector3 lookWorld = -camera.GlobalTransform.Basis.Z;
-            Vector3 n = new Vector3(lookWorld.X, 0f, lookWorld.Z);
-            if (n.LengthSquared() < 1e-8f)
-                n = Vector3.Right;
-            else
-                n = n.Normalized();
+            Vector3 n = _verticalSliceEvalPlaneNValid ? _verticalSliceEvalPlaneN : Vector3.Right;
             float s = (c - camPos).Dot(n);
+            float delta = VerticalSliceClipPlaneDelta;
 
             if (VerticalSliceHideBehindCameraSide)
             {
-                hideVertical = s < 0f;
+                // P' recule la frontière « visible » : derrière P' ⇔ s < -delta (delta>0 = bande de tolérance côté caméra).
+                hideVertical = s < -delta;
                 if (VerticalSliceForwardCutDepth > 0f && s > VerticalSliceForwardCutDepth)
                     hideVertical = true;
             }
             else
             {
-                hideVertical = s > 0f;
+                hideVertical = s > delta;
                 if (VerticalSliceForwardCutDepth > 0f && s < -VerticalSliceForwardCutDepth)
                     hideVertical = true;
             }
@@ -1314,27 +1426,24 @@ public partial class Game : Node3D
         }
 
         bool hideScreenBottom = false;
-        if (VerticalSliceScreenBottomHideFraction > 1e-4f)
+        if (_verticalSliceEvalNeedScreenBottom)
         {
-            Vector3 forward = -camera.GlobalTransform.Basis.Z;
-            if ((c - camPos).Dot(forward) > 0.02f)
+            if ((c - camPos).Dot(_verticalSliceEvalForward) > 0.02f)
             {
                 if (VerticalSliceScreenBottomFastCameraApprox)
                 {
-                    Transform3D inv = camera.GlobalTransform.AffineInverse();
-                    Vector3 lp = inv * c;
+                    Vector3 lp = _verticalSliceEvalInvCam * c;
                     float depth = -lp.Z;
                     if (depth > 0.02f)
                     {
-                        float tanHalf = Mathf.Tan(Mathf.DegToRad(camera.Fov * 0.5f));
-                        float yNorm = lp.Y / (depth * tanHalf + 1e-6f);
-                        hideScreenBottom = yNorm <= 2f * VerticalSliceScreenBottomHideFraction - 1f;
+                        float yNorm = lp.Y / (depth * _verticalSliceEvalTanHalfFov + 1e-6f);
+                        hideScreenBottom = yNorm <= 2f * _verticalSliceEvalBottomFrac - 1f;
                     }
                 }
                 else
                 {
                     Vector2 sp = camera.UnprojectPosition(c);
-                    float vh = GetViewport().GetVisibleRect().Size.Y;
+                    float vh = _verticalSliceEvalViewportHeight;
                     if (vh > 1e-4f && sp.Y >= vh * (1f - VerticalSliceScreenBottomHideFraction))
                         hideScreenBottom = true;
                 }
@@ -1350,6 +1459,13 @@ public partial class Game : Node3D
         return Mathf.RoundToInt(v * unitsPerBucket);
     }
 
+    static int QuantizeWorldPositionForPeel(float worldPos, float bucketWorld)
+    {
+        if (bucketWorld < 0.5f)
+            bucketWorld = 0.5f;
+        return Mathf.FloorToInt(worldPos / bucketWorld);
+    }
+
     ulong ComputeMultimeshPeelStateToken()
     {
         unchecked
@@ -1360,6 +1476,7 @@ public partial class Game : Node3D
             t ^= VerticalSliceInvertVisibility ? 3UL : 1UL;
             t ^= VerticalSliceUseVerticalCut ? 7UL : 2UL;
             t ^= VerticalSliceHideBehindCameraSide ? 11UL : 4UL;
+            t ^= (ulong)(uint)BitConverter.SingleToInt32Bits(VerticalSliceClipPlaneDelta);
             t ^= (ulong)(uint)BitConverter.SingleToInt32Bits(VerticalSliceForwardCutDepth);
             t ^= VerticalSlicePeelGroundWhenCameraLow ? 13UL : 8UL;
             t ^= (ulong)(uint)BitConverter.SingleToInt32Bits(VerticalSliceGroundPeelBelowY);
@@ -1367,6 +1484,7 @@ public partial class Game : Node3D
             t ^= (ulong)(uint)BitConverter.SingleToInt32Bits(VerticalSliceGroundPeelMargin);
             t ^= (ulong)(uint)BitConverter.SingleToInt32Bits(VerticalSliceScreenBottomHideFraction);
             t ^= VerticalSliceScreenBottomFastCameraApprox ? 19UL : 14UL;
+            t ^= (ulong)(uint)BitConverter.SingleToInt32Bits(VerticalSlicePeelCameraBucketWorld);
 
             foreach (var cell in _terrainOcclusionHidden)
                 t = t * 0xD1B54A32D192ED03UL + (ulong)cell.GetHashCode();
@@ -1374,17 +1492,18 @@ public partial class Game : Node3D
             if (_verticalSliceTerrainActive && camera != null)
             {
                 Vector3 p = camera.GlobalPosition;
-                // Quantification plus grossière = moins de recalculs peel par frame (moins de lag en coupe V).
-                t ^= (ulong)(uint)QuantizeForSliceToken(p.X, 14f) << 8;
-                t ^= (ulong)(uint)QuantizeForSliceToken(p.Y, 14f) << 16;
-                t ^= (ulong)(uint)QuantizeForSliceToken(p.Z, 14f) << 24;
+                float b = Mathf.Max(0.5f, VerticalSlicePeelCameraBucketWorld);
+                t ^= (ulong)(uint)QuantizeWorldPositionForPeel(p.X, b) << 8;
+                t ^= (ulong)(uint)QuantizeWorldPositionForPeel(p.Y, b) << 16;
+                t ^= (ulong)(uint)QuantizeWorldPositionForPeel(p.Z, b) << 24;
                 Vector3 lz = -camera.GlobalTransform.Basis.Z;
                 Vector3 horiz = new Vector3(lz.X, 0f, lz.Z);
                 if (horiz.LengthSquared() > 1e-10f)
                 {
                     horiz = horiz.Normalized();
-                    t ^= (ulong)(uint)QuantizeForSliceToken(horiz.X, 180f) << 4;
-                    t ^= (ulong)(uint)QuantizeForSliceToken(horiz.Z, 180f) << 12;
+                    // Regard : ~8° par cran pour limiter les invalidations peel.
+                    t ^= (ulong)(uint)QuantizeForSliceToken(horiz.X, 7f) << 4;
+                    t ^= (ulong)(uint)QuantizeForSliceToken(horiz.Z, 7f) << 12;
                 }
             }
 
@@ -1459,15 +1578,30 @@ public partial class Game : Node3D
 
     int ComputeTerrainHoverHighlightHash()
     {
-        if (_selectionTargetKind != WorldSelectionTargetKind.TerrainTiles || !TerrainHoverHighlightEnabled)
+        if (!TerrainHoverHighlightEnabled)
             return -173_173;
-        return _terrainHoverCell?.GetHashCode() ?? -1;
+        if (_selectionTargetKind != WorldSelectionTargetKind.TerrainTiles
+            && _selectionTargetKind != WorldSelectionTargetKind.Trees
+            && _selectionTargetKind != WorldSelectionTargetKind.Colonists)
+            return -173_174;
+        unchecked
+        {
+            int h = _terrainHoverCell?.GetHashCode() ?? -1;
+            return h * 397 ^ (int)_selectionTargetKind;
+        }
     }
 
     void UpdateTerrainHoverCell()
     {
         if (_selectionTargetKind != WorldSelectionTargetKind.TerrainTiles
-            || !TerrainHoverHighlightEnabled
+            && _selectionTargetKind != WorldSelectionTargetKind.Trees
+            && _selectionTargetKind != WorldSelectionTargetKind.Colonists)
+        {
+            _terrainHoverCell = null;
+            return;
+        }
+
+        if (!TerrainHoverHighlightEnabled
             || camera == null
             || sim?.World?.CurrentMap == null)
         {
@@ -1529,6 +1663,62 @@ public partial class Game : Node3D
         return from.DistanceTo(focusCenter) <= maxPick;
     }
 
+    /// <summary>
+    /// Ordre « Aller vers » : même bloc visé que minage/sélection (coupe, occlusion, Q/Alt),
+    /// puis première case d’air le long du rayon vers la caméra (évite le sol surface du vieux raycast grille).
+    /// </summary>
+    bool TryGetMoveOrderAnchorFromScreen(out Vector3I anchor)
+    {
+        anchor = default;
+        if (camera == null || sim?.World?.CurrentMap == null)
+            return false;
+
+        Vector2 vpMouse = camera.GetViewport().GetMousePosition();
+        if (TerrainPickUsePixelCenterRay)
+            vpMouse += new Vector2(0.5f, 0.5f);
+
+        if (!TryGetTerrainPickedCellViewport(vpMouse, out Vector3I hitSolid, respectPeelModifierKeys: true))
+            return false;
+
+        var from = camera.ProjectRayOrigin(vpMouse);
+        float pickRayLen = Mathf.Max(TerrainOcclusionRayMax, TerrainPickMaxDistance + 120f);
+        var map = sim.World.CurrentMap;
+
+        Vector3 center = new Vector3(hitSolid.X + 0.5f, hitSolid.Y + 0.5f, hitSolid.Z + 0.5f);
+        Vector3 towardCam = from - center;
+        if (towardCam.LengthSquared() < 1e-8f)
+            anchor = hitSolid + Vector3I.Up;
+        else
+        {
+            towardCam = towardCam.Normalized();
+            Vector3 p = center + towardCam * 0.06f;
+            bool found = false;
+            for (int i = 0; i < 56; i++)
+            {
+                p += towardCam * 0.11f;
+                var c = new Vector3I(Mathf.FloorToInt(p.X), Mathf.FloorToInt(p.Y), Mathf.FloorToInt(p.Z));
+                var tile = map.GetTile(c);
+                bool solid = tile != null && tile.Solid;
+                if (!solid)
+                {
+                    anchor = c;
+                    found = true;
+                    break;
+                }
+
+                if (solid && IsTerrainCellPickHidden(c))
+                    continue;
+            }
+
+            if (!found)
+                anchor = hitSolid + Vector3I.Up;
+        }
+
+        var anchorCenter = new Vector3(anchor.X + 0.5f, anchor.Y + 0.5f, anchor.Z + 0.5f);
+        float maxPick = Mathf.Max(TerrainPickMaxDistance, pickRayLen + 64f);
+        return from.DistanceTo(anchorCenter) <= maxPick;
+    }
+
     void ApplyTerrainSelectionHighlights()
     {
         if (sim?.World?.CurrentMap == null)
@@ -1569,7 +1759,9 @@ public partial class Game : Node3D
                 Color c = baseC;
 
                 if (TerrainHoverHighlightEnabled
-                    && _selectionTargetKind == WorldSelectionTargetKind.TerrainTiles
+                    && (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles
+                        || _selectionTargetKind == WorldSelectionTargetKind.Trees
+                        || _selectionTargetKind == WorldSelectionTargetKind.Colonists)
                     && _terrainHoverCell.HasValue
                     && w == _terrainHoverCell.Value)
                 {
@@ -1617,34 +1809,20 @@ public partial class Game : Node3D
 
     void TryPickTreeAtScreen()
     {
-        Vector2 vpMouse = camera.GetViewport().GetMousePosition();
-        var from = camera.ProjectRayOrigin(vpMouse);
-        var to = from + camera.ProjectRayNormal(vpMouse) * 500f;
-        var query = PhysicsRayQueryParameters3D.Create(from, to);
-        query.CollisionMask = 1 << 1;
-        var hit = camera.GetWorld3D().DirectSpaceState.IntersectRay(query);
-        if (hit.Count == 0)
+        // Même chaîne que blocs / minage : DDA coupe V, physique, Q/Alt = fond, pixel centré si export.
+        if (!TryGetTerrainPickedCellFromScreen(out Vector3I pick, respectPeelModifierKeys: true))
         {
             _selectedTreeTile = null;
             UpdateSelectionTargetUi();
             return;
         }
 
-        var obj = hit["collider"].AsGodotObject() as Node;
-        while (obj != null)
+        var t = sim.World.CurrentMap.GetTile(pick);
+        if (t != null && t.Type == "tree")
         {
-            if (obj is Node3D n3 && _treeTileByRoot.TryGetValue(n3, out var tile))
-            {
-                var t = sim.World.CurrentMap.GetTile(tile);
-                if (t != null && t.Type == "tree")
-                {
-                    _selectedTreeTile = tile;
-                    UpdateSelectionTargetUi();
-                    return;
-                }
-                break;
-            }
-            obj = obj.GetParent();
+            _selectedTreeTile = pick;
+            UpdateSelectionTargetUi();
+            return;
         }
 
         _selectedTreeTile = null;

@@ -13,6 +13,9 @@ public partial class Simulation :GodotObject
 
     public PlayerVision Vision = new PlayerVision();
 
+    /// <summary>Rayon de vision en tuiles (sphère monde, pas au pas des chunks).</summary>
+    public int VisionRadiusTiles = 12;
+
     Pathfinder pathfinder;
     readonly PathRequestService pathRequestService = new PathRequestService();
     public JobBoard jobBoard;
@@ -30,6 +33,7 @@ public partial class Simulation :GodotObject
 
     public void Init()
     {
+        Vision.ResetAll();
         var map = World.CurrentMap;
         pathfinder = new Pathfinder(
             (pos) => map.GetTile(pos),
@@ -177,6 +181,58 @@ public partial class Simulation :GodotObject
         colon.MoveProgress = 0f;
         colon.HasPathFailed = false;
         RepathColonistToActiveJobWork(colon);
+    }
+
+    /// <summary>Cache de chemins + chemins en mémoire invalidés quand un job change la marchabilité (mine, arbre, etc.).</summary>
+    void NotifyMapWalkabilityChanged()
+    {
+        pathRequestService.InvalidateAll();
+        foreach (var c in World.CurrentMap.Colonists)
+        {
+            if (c.OwnerId != 0)
+                continue;
+            if (c.ActiveJob != null)
+                RepathColonistToActiveJobWork(c);
+            else if (c.Path != null && c.Path.Count > 0)
+                RepathColonistToMoveTarget(c);
+        }
+    }
+
+    void RepathColonistToMoveTarget(Colonist colon)
+    {
+        if (colon.Path == null || colon.Path.Count == 0)
+            return;
+
+        if (!pathfinder.IsWalkable(colon.Target))
+        {
+            colon.Path = null;
+            colon.HasPathFailed = true;
+            colon.MoveProgress = 0f;
+            return;
+        }
+
+        var path = pathRequestService.GetOrCreatePath(colon.Position, colon.Target);
+        if (path == null || path.Count <= 1)
+        {
+            colon.Path = null;
+            colon.HasPathFailed = true;
+            colon.MoveProgress = 0f;
+            return;
+        }
+
+        path = pathfinder.SmoothPath(new List<Vector3I>(path));
+        if (path == null || path.Count <= 1)
+        {
+            colon.Path = null;
+            colon.HasPathFailed = true;
+            colon.MoveProgress = 0f;
+            return;
+        }
+
+        path.RemoveAt(0);
+        colon.Path = path;
+        colon.MoveProgress = 0f;
+        colon.HasPathFailed = false;
     }
 
     /// <summary>Après une chute, retente le chemin vers la case de travail ou annule le job.</summary>
@@ -363,35 +419,37 @@ public partial class Simulation :GodotObject
             OnJobCompleted?.Invoke(GetColonistIndex(colon), job.Target);
         }
 
+        NotifyMapWalkabilityChanged();
+
         jobBoard.Complete(job);
         colon.ActiveJob = null;
         colon.WorkTicksRemaining = 0;
     }
 
 
+    /// <summary>Couche extérieure du cube de rayon r (Chebyshev) autour de l’origine.</summary>
+    static bool OnChebyshevShell(int dx, int dy, int dz, int r)
+    {
+        return Mathf.Max(Mathf.Abs(dx), Mathf.Max(Mathf.Abs(dy), Mathf.Abs(dz))) == r;
+    }
+
     Vector3I FindNearestFree(Vector3I target)
     {
         if (IsWalkableAndFree(target))
             return target;
 
-        int radius = 1;
-
-        while (radius < 10)
+        for (int r = 1; r < 10; r++)
         {
-            for (int x = -radius; x <= radius; x++)
-            for (int z = -radius; z <= radius; z++)
+            for (int dx = -r; dx <= r; dx++)
+            for (int dy = -r; dy <= r; dy++)
+            for (int dz = -r; dz <= r; dz++)
             {
-                var pos = new Vector3I(
-                    target.X + x,
-                    target.Y,
-                    target.Z + z
-                );
-
+                if (!OnChebyshevShell(dx, dy, dz, r))
+                    continue;
+                var pos = new Vector3I(target.X + dx, target.Y + dy, target.Z + dz);
                 if (IsWalkableAndFree(pos))
                     return pos;
             }
-
-            radius++;
         }
 
         return target;
@@ -457,25 +515,23 @@ public partial class Simulation :GodotObject
     }
 
 
-   public Vector3I FindNearestFreeWithReservation(Vector3I target, HashSet<Vector3I> reserved)
+    public Vector3I FindNearestFreeWithReservation(Vector3I target, HashSet<Vector3I> reserved)
     {
         if (IsWalkableAndFree(target) && !reserved.Contains(target))
             return target;
 
-        int radius = 1;
-
-        while (radius < 10)
+        for (int r = 1; r < 10; r++)
         {
-            for (int x = -radius; x <= radius; x++)
-            for (int z = -radius; z <= radius; z++)
+            for (int dx = -r; dx <= r; dx++)
+            for (int dy = -r; dy <= r; dy++)
+            for (int dz = -r; dz <= r; dz++)
             {
-                var pos = new Vector3I(target.X + x, target.Y, target.Z + z);
-
+                if (!OnChebyshevShell(dx, dy, dz, r))
+                    continue;
+                var pos = new Vector3I(target.X + dx, target.Y + dy, target.Z + dz);
                 if (IsWalkableAndFree(pos) && !reserved.Contains(pos))
                     return pos;
             }
-
-            radius++;
         }
 
         return target;
@@ -484,34 +540,30 @@ public partial class Simulation :GodotObject
 
     void UpdateVision(Colonist colon)
     {
-        int radius = 8;
+        int R = VisionRadiusTiles;
+        if (R < 1)
+            R = 1;
+        int r2 = R * R;
 
-        // Inclure le bedrock / grottes sous les colons et le ciel proche
-        for (int x = -radius; x <= radius; x++)
-        for (int y = -12; y <= 4; y++)
-        for (int z = -radius; z <= radius; z++)
+        for (int x = -R; x <= R; x++)
+        for (int y = -R; y <= R; y++)
+        for (int z = -R; z <= R; z++)
         {
-            var offset = new Vector3I(x, y, z);
-
-            // 🔥 distance sphérique
-            if (x*x + z*z > radius * radius)
+            if (x * x + y * y + z * z > r2)
                 continue;
 
-            var target = colon.Position + offset;
+            var target = colon.Position + new Vector3I(x, y, z);
 
             if (HasLineOfSight(colon.Position, target))
-            {
                 Vision.AddVisible(target);
-            }
         }
 
-        // Sol de surface (arbres / herbe) : découvrir dans un disque sans LOS strict,
-        // sinon les arbres restent « invisibles » dès qu’un relief bloque le rayon.
+        // Sol de surface (arbres / herbe) : disque horizontal en tuiles, pas lié aux chunks.
         int fy = Map.WorldFloorY;
-        for (int x = -radius; x <= radius; x++)
-        for (int z = -radius; z <= radius; z++)
+        for (int x = -R; x <= R; x++)
+        for (int z = -R; z <= R; z++)
         {
-            if (x * x + z * z > radius * radius)
+            if (x * x + z * z > r2)
                 continue;
             Vision.AddDiscovered(new Vector3I(colon.Position.X + x, fy, colon.Position.Z + z));
         }

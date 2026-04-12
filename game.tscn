@@ -11,8 +11,10 @@ ambient_light_energy = 0.45
 
 [node name="Game" type="Node3D" unique_id=230355190]
 script = ExtResource("1_80nbo")
+VerticalSliceInvertVisibility = true
 VerticalSliceHideBehindCameraSide = true
 VerticalSliceForwardCutDepth = 8.0
+VerticalSliceScreenBottomHideFraction = 0.09
 
 [node name="CameraPivot" type="Node3D" parent="." unique_id=751720371]
 
