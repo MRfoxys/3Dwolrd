@@ -3,7 +3,8 @@ using Godot;
 
 public enum JobType
 {
-    CutTree
+    CutTree,
+    MineStone,
 }
 
 public enum JobPriority
@@ -47,27 +48,27 @@ public class WorkGiverCutTree : IWorkGiver
             var chunkPos = pair.Key;
             var chunk = pair.Value;
 
-            for (int x = 0; x < Map.CHUNK_SIZE; x++)
-            for (int y = 0; y < Map.CHUNK_SIZE; y++)
-            for (int z = 0; z < Map.CHUNK_SIZE; z++)
-            {
-                var tile = chunk.Tiles[x, y, z];
-                if (tile == null || tile.Type != "tree")
-                    continue;
+            // for (int x = 0; x < Map.CHUNK_SIZE; x++)
+            // for (int y = 0; y < Map.CHUNK_SIZE; y++)
+            // for (int z = 0; z < Map.CHUNK_SIZE; z++)
+            // {
+            //     var tile = chunk.Tiles[x, y, z];
+            //     if (tile == null || tile.Type != "tree")
+            //         continue;
 
-                var worldPos = new Vector3I(
-                    chunkPos.X * Map.CHUNK_SIZE + x,
-                    chunkPos.Y * Map.CHUNK_SIZE + y,
-                    chunkPos.Z * Map.CHUNK_SIZE + z
-                );
+            //     var worldPos = new Vector3I(
+            //         chunkPos.X * Map.CHUNK_SIZE + x,
+            //         chunkPos.Y * Map.CHUNK_SIZE + y,
+            //         chunkPos.Z * Map.CHUNK_SIZE + z
+            //     );
 
-                board.AddJob(new SimJob
-                {
-                    Type = JobType.CutTree,
-                    Priority = JobPriority.Normal,
-                    Target = worldPos
-                });
-            }
+            //     board.AddJob(new SimJob
+            //     {
+            //         Type = JobType.CutTree,
+            //         Priority = JobPriority.Normal,
+            //         Target = worldPos
+            //     });
+            // }
         }
     }
 }
@@ -100,6 +101,43 @@ public class JobBoard
         jobs.Remove(job.Id);
     }
 
+    public bool HasActiveJobOnTarget(Vector3I worldTile, JobType type)
+    {
+        foreach (var j in jobs.Values)
+        {
+            if (j.Type != type || j.Target != worldTile)
+                continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>Jobs encore dans la file (disponible ou réservé à un colon).</summary>
+    public void CopyActiveJobs(List<SimJob> buffer)
+    {
+        buffer.Clear();
+        foreach (var j in jobs.Values)
+        {
+            if (j.Status != JobStatus.Available && j.Status != JobStatus.Reserved)
+                continue;
+            buffer.Add(j);
+        }
+    }
+
+    public int ActiveJobCount
+    {
+        get
+        {
+            int n = 0;
+            foreach (var j in jobs.Values)
+            {
+                if (j.Status == JobStatus.Available || j.Status == JobStatus.Reserved)
+                    n++;
+            }
+            return n;
+        }
+    }
+
     public bool TryReserveBest(int colonistId, Vector3I colonPos, out SimJob job)
     {
         job = null;
@@ -111,9 +149,11 @@ public class JobBoard
             if (j.Status != JobStatus.Available)
                 continue;
 
-            int distance = Mathf.Abs(colonPos.X - j.WorkPosition.X) +
-                           Mathf.Abs(colonPos.Y - j.WorkPosition.Y) +
-                           Mathf.Abs(colonPos.Z - j.WorkPosition.Z);
+            // WorkPosition n'est rempli qu'à l'assignation ; le tri se fait sur la cible du job
+            var anchor = j.Target;
+            int distance = Mathf.Abs(colonPos.X - anchor.X) +
+                            Mathf.Abs(colonPos.Y - anchor.Y) +
+                            Mathf.Abs(colonPos.Z - anchor.Z);
             int score = ((int)j.Priority * 1000) - distance;
             if (score <= bestScore)
                 continue;
@@ -130,3 +170,4 @@ public class JobBoard
         return true;
     }
 }
+

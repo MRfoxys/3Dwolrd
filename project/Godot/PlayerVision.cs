@@ -17,6 +17,12 @@ public class PlayerVision
         Discovered.Add(pos);
     }
 
+    /// <summary>Découverte sans être « en ligne de vue » ce tick (sol, décor proche).</summary>
+    public void AddDiscovered(Vector3I pos)
+    {
+        Discovered.Add(pos);
+    }
+
     public bool IsVisible(Vector3I pos)
     {
         return Visible.Contains(pos);

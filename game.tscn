@@ -2,6 +2,13 @@
 
 [ext_resource type="Script" uid="uid://w5rs5rq8kmyx" path="res://project/Godot/Game.cs" id="1_80nbo"]
 
+[sub_resource type="Environment" id="Environment_main"]
+background_mode = 1
+background_color = Color(0.4, 0.48, 0.55, 1)
+ambient_light_source = 1
+ambient_light_color = Color(0.98, 0.95, 0.88, 1)
+ambient_light_energy = 0.45
+
 [sub_resource type="BoxShape3D" id="BoxShape3D_e2o6t"]
 size = Vector3(1, 1.1977539, 1)
 
@@ -9,16 +16,24 @@ size = Vector3(1, 1.1977539, 1)
 
 [node name="Game" type="Node3D" unique_id=230355190]
 script = ExtResource("1_80nbo")
+VerticalSliceHideBehindCameraSide = true
+VerticalSliceForwardCutDepth = 8.0
 
 [node name="CameraPivot" type="Node3D" parent="." unique_id=751720371]
 
 [node name="Camera3D" type="Camera3D" parent="CameraPivot" unique_id=1512669225]
 transform = Transform3D(0.7071068, -0.5, 0.5, 0, 0.7071068, 0.7071068, -0.7071068, -0.5, 0.5, 10, 15, 10)
 
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=1972289267]
+environment = SubResource("Environment_main")
+
 [node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1453640701]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 60.71948, 0)
+light_energy = 1.15
+shadow_enabled = true
 
 [node name="Ground" type="StaticBody3D" parent="." unique_id=1352212076]
+collision_mask = 0
 
 [node name="CollisionShape3D" type="CollisionShape3D" parent="Ground" unique_id=1956828927]
 transform = Transform3D(100, 0, 0, 0, 1, 0, 0, 0, 100, 0, 0, 0)
@@ -37,3 +52,65 @@ offset_right = 40.0
 offset_bottom = 40.0
 mouse_filter = 2
 color = Color(0, 0.5647059, 0, 0.8745098)
+
+[node name="SelectionPanel" type="PanelContainer" parent="UI" unique_id=1308495828]
+offset_left = 8.0
+offset_top = 8.0
+offset_right = 340.0
+offset_bottom = 320.0
+
+[node name="VBox" type="VBoxContainer" parent="UI/SelectionPanel" unique_id=810891243]
+layout_mode = 2
+
+[node name="ModeLabel" type="Label" parent="UI/SelectionPanel/VBox" unique_id=1423957898]
+layout_mode = 2
+text = "Cible : Colons"
+
+[node name="ModeRow" type="HBoxContainer" parent="UI/SelectionPanel/VBox" unique_id=426371947]
+layout_mode = 2
+
+[node name="BtnColonists" type="Button" parent="UI/SelectionPanel/VBox/ModeRow" unique_id=1996612012]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Colons"
+
+[node name="BtnTrees" type="Button" parent="UI/SelectionPanel/VBox/ModeRow" unique_id=2044297263]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Arbres"
+
+[node name="BtnTerrainTiles" type="Button" parent="UI/SelectionPanel/VBox/ModeRow" unique_id=242134066]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Blocs"
+
+[node name="TreeTargetLabel" type="Label" parent="UI/SelectionPanel/VBox" unique_id=466741857]
+layout_mode = 2
+text = "Arbre : (aucun)"
+autowrap_mode = 2
+
+[node name="BtnCutTree" type="Button" parent="UI/SelectionPanel/VBox" unique_id=1041210536]
+layout_mode = 2
+disabled = true
+text = "Couper cet arbre"
+
+[node name="BtnMineStone" type="Button" parent="UI/SelectionPanel/VBox" unique_id=1990596942]
+layout_mode = 2
+disabled = true
+text = "Miner ce bloc (pierre ou sol)"
+
+[node name="TerrainTileLabel" type="Label" parent="UI/SelectionPanel/VBox" unique_id=549314307]
+layout_mode = 2
+text = "Tuile : (aucune)"
+autowrap_mode = 2
+
+[node name="HintLabel" type="Label" parent="UI/SelectionPanel/VBox" unique_id=1750261864]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.75, 0.75, 0.75, 1)
+text = "T modes · Q/Alt percée · Blocs Shift+clic · V coupe (vertical + pelage sol si cam basse)"
+autowrap_mode = 2
+
+[node name="JobsQueueLabel" type="Label" parent="UI/SelectionPanel/VBox" unique_id=383618892]
+layout_mode = 2
+text = "Travail en attente : aucun"
+autowrap_mode = 3

@@ -4,11 +4,7 @@ using System.Collections.Generic;
 public class Colonist
 {
     public int OwnerId;
-    public int X;
-    public int Y;
-    public int Z;
-
-    public Vector3I Position => new Vector3I(X, Y, Z);
+    public Vector3I Position { get; set; }
     public int WaitTimer = 0;
 
     public Vector3I Target;
@@ -24,17 +20,35 @@ public class Colonist
 
     public Colonist()
     {
-        X= 0;
-        Y = 0;
-        Z = 0;
+        Position = new Vector3I(0, 0, 0);
         Target = new Vector3I(0, 0, 0);
     }
 
-    public Colonist(int spawnX ,int spawnY, int spawnZ)
+    public Colonist(int spawnX ,int spawnY, int spawnZ , int ownerId = 0)
     {
-        X= spawnX;
-        Y = spawnY;
-        Z = spawnZ;
+        Position = new Vector3I(spawnX, spawnY, spawnZ);
         Target = new Vector3I(0, 0, 0);
+        OwnerId = ownerId;
+        GD.Print($"Colon créé à {Position}");
+    }
+
+    public void MoveTo(Vector3I newPos, Map map)
+    {
+        // 🔹 Génère les chunks autour de la nouvelle position
+        var chunkPos = new Vector3I(
+            Mathf.FloorToInt((float)newPos.X / Map.CHUNK_SIZE),
+            0,
+            Mathf.FloorToInt((float)newPos.Z / Map.CHUNK_SIZE)
+        );
+
+        // Génère les chunks dans un rayon de 1 autour du colon
+        for (int x = -1; x <= 1; x++)
+        for (int z = -1; z <= 1; z++)
+        {
+            map.GetOrCreateChunk(new Vector3I(chunkPos.X + x, 0, chunkPos.Z + z));
+        }
+
+        Position = newPos;
+        GD.Print($"Colon déplacé à {Position}");
     }
 }

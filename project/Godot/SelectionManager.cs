@@ -4,12 +4,18 @@ using System.Collections.Generic;
 public class SelectionManager
 {
     const float DRAG_THRESHOLD_PIXELS = 12f;
+    const float CLICK_SELECT_PIXELS = 26f;
+    /// <summary>Demi-largeur monde autour du rayon pour un clic colon (évite de prendre le voisin projeté à côté après rotation caméra).</summary>
+    const float COLONIST_RAY_PICK_RADIUS = 1.15f;
+    const float COLONIST_RAY_MIN_T = 0.12f;
 
     Camera3D camera;
     Dictionary<Colonist, Node3D> visuals;
     int localPlayerId;
 
     public List<Colonist> SelectedColonists = new();
+    public WorldSelectionTargetKind TargetKind { get; set; } = WorldSelectionTargetKind.Colonists;
+
     bool leftPressed = false;
     bool dragging = false;
     public bool IsDragging => dragging && leftPressed;
@@ -25,6 +31,9 @@ public class SelectionManager
 
     public void HandleInput(InputEvent @event)
     {
+        if (TargetKind != WorldSelectionTargetKind.Colonists)
+            return;
+
         if (@event is InputEventMouseButton mouse)
         {
             if (mouse.ButtonIndex == MouseButton.Left)
@@ -80,66 +89,64 @@ public class SelectionManager
         }
         else
         {
-            // 🔥 CLICK → raycast monde
-            Vector3 worldPos = GetMouseGridPosition();
+            // Clic simple : d'abord distance au rayon 3D (précis après orbite), puis repli pixels si rien.
+            var mouse = camera.GetViewport().GetMousePosition();
+            var from = camera.ProjectRayOrigin(mouse);
+            var dir = camera.ProjectRayNormal(mouse).Normalized();
 
-            Colonist closest = null;
-            float bestDist = 1.2f;
-
+            Colonist closestRay = null;
+            float bestRayScore = float.MaxValue;
             foreach (var pair in visuals)
             {
                 var colon = pair.Key;
                 var node = pair.Value;
-
                 if (colon.OwnerId != localPlayerId)
                     continue;
 
-                float dist = node.GlobalPosition.DistanceTo(worldPos);
-
-                if (dist < bestDist)
+                Vector3 p = node.GlobalPosition;
+                float t = (p - from).Dot(dir);
+                if (t < COLONIST_RAY_MIN_T)
+                    continue;
+                Vector3 onRay = from + dir * t;
+                float perp = p.DistanceTo(onRay);
+                if (perp > COLONIST_RAY_PICK_RADIUS)
+                    continue;
+                float pix = camera.UnprojectPosition(p).DistanceTo(mouse);
+                float score = perp * 120f + pix;
+                if (score < bestRayScore)
                 {
-                    bestDist = dist;
-                    closest = colon;
+                    bestRayScore = score;
+                    closestRay = colon;
                 }
             }
 
-            if (closest != null)
-                SelectedColonists.Add(closest);
+            if (closestRay != null)
+            {
+                SelectedColonists.Add(closestRay);
+            }
+            else
+            {
+                Colonist closest = null;
+                float bestPx = CLICK_SELECT_PIXELS;
+                foreach (var pair in visuals)
+                {
+                    var colon = pair.Key;
+                    var node = pair.Value;
+                    if (colon.OwnerId != localPlayerId)
+                        continue;
+                    float d = camera.UnprojectPosition(node.GlobalPosition).DistanceTo(mouse);
+                    if (d < bestPx)
+                    {
+                        bestPx = d;
+                        closest = colon;
+                    }
+                }
+                if (closest != null)
+                    SelectedColonists.Add(closest);
+            }
         }
 
         GD.Print("Selected count: ", SelectedColonists.Count);
-    }
-
-    Vector3I GetMouseGridPosition()
-    {
-        var mousePos = camera.GetViewport().GetMousePosition();
-
-        var from = camera.ProjectRayOrigin(mousePos);
-        var to = from + camera.ProjectRayNormal(mousePos) * 1000;
-
-        var space = camera.GetWorld3D().DirectSpaceState;
-        var query = PhysicsRayQueryParameters3D.Create(from, to);
-
-        var result = space.IntersectRay(query);
-
-        if (result.Count > 0)
-        {
-            var pos = (Vector3)result["position"];
-            var normal = (Vector3)result["normal"];
-
-            int x = Mathf.FloorToInt(pos.X);
-            int y = Mathf.FloorToInt(pos.Y);
-            int z = Mathf.FloorToInt(pos.Z);
-
-            // clic sur surface → on va au dessus
-            if (normal.Y > 0.5f)
-                y += 1;
-
-            return new Vector3I(x, y, z);
-        }
-
-
-        return new Vector3I(0, 0, 0);
     }
 
     public Rect2 GetScreenRect()

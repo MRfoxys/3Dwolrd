@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System;
 using Godot;
 
 public class Map
@@ -8,21 +9,55 @@ public class Map
 
     public const int CHUNK_SIZE = 16;
 
+    /// <summary>Couche sol (plateforme / tronc d'arbre). Le monde « bas » reste y=0 (bedrock + grottes).</summary>
+    public const int WorldFloorY = 11;
+
+    /// <summary>Couche d'air où les colons se déplacent (au-dessus du sol solide en y=11).</summary>
+    public const int ColonistWalkY = 12;
+
+    public Random random;
+    public int WorldSeed { get; }
+
     // =========================
     // 🌍 TILE ACCESS
     // =========================
     public Tile GetTile(Vector3I worldPos)
     {
-        var chunk = GetChunk(worldPos);
-        var local = WorldToLocal(worldPos);
+        var chunkPos = new Vector3I(
+            Mathf.FloorToInt((float)worldPos.X / CHUNK_SIZE),
+            Mathf.FloorToInt((float)worldPos.Y / CHUNK_SIZE),
+            Mathf.FloorToInt((float)worldPos.Z / CHUNK_SIZE)
+        );
 
-        var tile = chunk.Tiles[local.X, local.Y, local.Z];
+        var chunk = GetOrCreateChunk(chunkPos);
+        if (chunk == null)
+        {
+            GD.PrintErr($"[Map] Chunk introuvable à {chunkPos}");
+            return null;
+        }
 
-        // 🔥 IMPORTANT : jamais null
-        if (tile == null)
-            return new Tile { Solid = false }; // air
+        int localX = worldPos.X % CHUNK_SIZE;
+        int localY = worldPos.Y % CHUNK_SIZE;
+        int localZ = worldPos.Z % CHUNK_SIZE;
 
-        return tile;
+        // Gérer les indices négatifs
+        if (localX < 0) localX += CHUNK_SIZE;
+        if (localY < 0) localY += CHUNK_SIZE;
+        if (localZ < 0) localZ += CHUNK_SIZE;
+
+        if (localX >= CHUNK_SIZE || localY >= CHUNK_SIZE || localZ >= CHUNK_SIZE)
+        {
+            GD.PrintErr($"[Map] Indices locaux invalides pour {worldPos} (chunk {chunkPos})");
+            return null;
+        }
+
+        return chunk.Tiles[localX, localY, localZ];
+    }
+
+    public Map(int seed = 42) // Seed par défaut = 42 (peut être changé)
+    {
+        WorldSeed = seed;
+        random = new Random(seed);
     }
 
     public void SetTile(Vector3I worldPos, Tile tile)
@@ -92,32 +127,76 @@ public class Map
         for (int y = 0; y < CHUNK_SIZE; y++)
         for (int z = 0; z < CHUNK_SIZE; z++)
         {
+            int worldX = chunkPos.X * CHUNK_SIZE + x;
             int worldY = chunkPos.Y * CHUNK_SIZE + y;
+            int worldZ = chunkPos.Z * CHUNK_SIZE + z;
 
             var tile = new Tile();
 
-            // 🌱 sol de base
+            // 🌍 SEULEMENT y=0 est du sol (ground)
             if (worldY == 0)
             {
-                tile.Solid = true;
                 tile.Type = "ground";
-            }
-
-            // 🟧 plateforme test
-            if (worldY == 3 && x > 4 && x < 10 && z > 4 && z < 10)
-            {
                 tile.Solid = true;
+            }
+            // 🏔️ Entre y=1 et y=10 : masse de pierre + cavités (bruit 3D cohérent)
+            else if (worldY > 0 && worldY <= 10)
+            {
+                float cave = TerrainNoise.Sample3D(
+                    worldX * 0.11f,
+                    worldY * 0.10f,
+                    worldZ * 0.11f,
+                    WorldSeed);
+
+                // Seuil plus haut = plus de grottes / tunnels reliés
+                if (cave > 0.56f)
+                {
+                    tile.Type = "air";
+                    tile.Solid = false;
+                }
+                else
+                {
+                    tile.Type = "stone";
+                    tile.Solid = true;
+                }
+            }
+            // 🛠️ Sol de jeu : plateforme (les colons marchent dans la couche d'air au-dessus)
+            else if (worldY == WorldFloorY)
+            {
                 tile.Type = "platform";
-            }
-
-            // 🟨 escalier simple
-            if (worldY == 1 && x == 6 && z == 6)
-            {
                 tile.Solid = true;
-                tile.Type = "stairs";
+            }
+            // 🌌 Au-dessus du sol de jeu : air
+            else
+            {
+                tile.Type = "air";
+                tile.Solid = false;
             }
 
             chunk.Tiles[x, y, z] = tile;
+        }
+
+        // 🌳 Arbres sur la surface de jeu (même hauteur que la plateforme), pas sur le bedrock y=0
+        const int treeSalt = 913_517;
+        int floorLocalY = WorldFloorY - chunkPos.Y * CHUNK_SIZE;
+        if (floorLocalY >= 0 && floorLocalY < CHUNK_SIZE)
+        {
+            for (int x = 0; x < CHUNK_SIZE; x++)
+            for (int z = 0; z < CHUNK_SIZE; z++)
+            {
+                var floorTile = chunk.Tiles[x, floorLocalY, z];
+                if (floorTile == null || floorTile.Type != "platform")
+                    continue;
+
+                int wx = chunkPos.X * CHUNK_SIZE + x;
+                int wz = chunkPos.Z * CHUNK_SIZE + z;
+                float scatter = TerrainNoise.Sample3D(wx * 0.27f, WorldFloorY * 0.07f, wz * 0.27f, WorldSeed + treeSalt);
+                if (scatter > 0.82f && random.NextDouble() < 0.4)
+                {
+                    floorTile.Type = "tree";
+                    floorTile.Solid = true;
+                }
+            }
         }
 
         return chunk;
@@ -163,13 +242,12 @@ public class Map
     }
 
     public Chunk GetOrCreateChunk(Vector3I chunkPos)
-{
-    if (!Chunks.TryGetValue(chunkPos, out var chunk))
     {
-        chunk = GenerateFlatChunk(chunkPos);
-        Chunks[chunkPos] = chunk;
+        if (!Chunks.TryGetValue(chunkPos, out var chunk))
+        {
+            chunk = GenerateChunk(chunkPos);
+            Chunks[chunkPos] = chunk;
+        }
+        return chunk;
     }
-
-    return chunk;
-}
 }

@@ -64,6 +64,11 @@ camera_down={
 ]
 }
 
+[layer_names]
+
+3d_physics/layer_1="terrain"
+3d_physics/layer_2="resource_pick"
+
 [physics]
 
 3d/physics_engine="Jolt Physics"

@@ -1,0 +1,20 @@
+[gd_scene format=3 uid="uid://c08rrqpy4v26f"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_3cdip"]
+shading_mode = 0
+albedo_color = Color(0.18697414, 0.44849825, 0.18491247, 1)
+
+[sub_resource type="PlaneMesh" id="PlaneMesh_7oqlf"]
+material = SubResource("StandardMaterial3D_3cdip")
+size = Vector2(0.5, 0.5)
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_d2gna"]
+size = Vector3(0.5, 0, 0.5)
+
+[node name="Grass" type="Node3D" unique_id=1564304501]
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="." unique_id=1100073117]
+mesh = SubResource("PlaneMesh_7oqlf")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="." unique_id=1208453967]
+shape = SubResource("BoxShape3D_d2gna")

@@ -1,0 +1,20 @@
+[gd_scene format=3 uid="uid://dcma8vgobj506"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_wmjae"]
+shading_mode = 0
+albedo_color = Color(0.36282963, 0.36282945, 0.36282927, 1)
+
+[sub_resource type="BoxMesh" id="BoxMesh_177fh"]
+material = SubResource("StandardMaterial3D_wmjae")
+size = Vector3(0.8, 0.8, 0.8)
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_ymqyl"]
+size = Vector3(0.8, 0.8, 0.8)
+
+[node name="Stone" type="Node3D" unique_id=1262129421]
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="." unique_id=2068304716]
+mesh = SubResource("BoxMesh_177fh")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="." unique_id=1960333217]
+shape = SubResource("BoxShape3D_ymqyl")

@@ -3,10 +3,10 @@ using System.Collections.Generic;
 
 public class Chunk
 {
-    public Tile[,,] Tiles = new Tile[SIZE, SIZE, SIZE];
+    public Tile[,,] Tiles { get; set; } = new Tile[SIZE, SIZE, SIZE];
     public const int SIZE = 16;
 
-    public Vector3I ChunkPos;
+    public Vector3I ChunkPos { get; set; }
 
     Vector3I WorldToChunk(Vector3I pos)
     {
