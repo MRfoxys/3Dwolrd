@@ -44,6 +44,19 @@ public partial class Game : Node3D
     /// <summary>Rayon de la vision des colons en tuiles (sphère, LOS par tuile).</summary>
     [Export(PropertyHint.Range, "4,40,1")]
     public int ColonistVisionRadiusTiles = 12;
+    [ExportGroup("Camera Smart Cut")]
+    /// <summary>Masque automatiquement les blocs entre caméra et le focus (sélection, optionnellement survol), même sans Q.</summary>
+    [Export] public bool CameraSmartCutEnabled = true;
+    /// <summary>Si true, le smart cut suit aussi la case sous la souris (sinon « tunnel » transparent qui suit le curseur).</summary>
+    [Export] public bool CameraSmartCutUseTerrainHover = false;
+    /// <summary>Nombre de blocs conservés côté focus (évite d'ouvrir trop profondément la coupe).</summary>
+    [Export(PropertyHint.Range, "0,6,1")]
+    public int CameraSmartCutKeepLastSolids = 1;
+    /// <summary>Distance max caméra→focus pour activer le smart cut auto (Q/Alt ignore cette limite).</summary>
+    [Export] public float CameraSmartCutMaxDistance = 90f;
+    [Export] public float CameraSmartCutRadius = 1.35f;
+    [Export] public float CameraSmartCutFadeWidth = 1.25f;
+    [Export] public float CameraSmartCutMinAlpha = 0.2f;
     bool debugChunks = false;
 
     [Export] public float TerrainOcclusionMaxCameraDistance = 50f;
@@ -95,7 +108,7 @@ public partial class Game : Node3D
 
     Dictionary<Vector3I, ChunkVisual> _chunkVisuals = new();
     BoxMesh _tileCubeMesh;
-    StandardMaterial3D _chunkSolidMaterial;
+    Shader _terrainSmartCutShader;
     int lastChunkRefreshTick = -1;
     int lastChunkVisibilityTick = -1;
     long lastChunkRefreshMicroseconds = 0;
@@ -206,10 +219,8 @@ public partial class Game : Node3D
         spawnedTiles.Clear();
 
         _tileCubeMesh = new BoxMesh();
-        _chunkSolidMaterial = new StandardMaterial3D();
-        _chunkSolidMaterial.VertexColorUseAsAlbedo = true;
-        _chunkSolidMaterial.ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded;
-        _tileCubeMesh.SurfaceSetMaterial(0, _chunkSolidMaterial);
+        _terrainSmartCutShader = GD.Load<Shader>("res://project/Godot/Shaders/TerrainSmartCut.gdshader");
+        _tileCubeMesh.SurfaceSetMaterial(0, null);
 
         cameraController = new CameraController(cameraPivot, camera);
         selectionManager = new SelectionManager(camera, colonVisuals, localPlayerId);
@@ -265,7 +276,11 @@ public partial class Game : Node3D
         
 
         Render();
+        bool hasFollow = TryGetCameraFollowPoint(out Vector3 followPos);
+        cameraController.SetFocusPoint(followPos, hasFollow);
         cameraController.Update(delta);
+        bool hasCutFocus = TryGetSmartCutFocusPoint(out Vector3 cutFocus);
+        UpdateSmartCutShaderParameters(hasCutFocus, cutFocus);
         RefreshJobsQueueUi();
         RefreshTreeJobOverlays();
         if (_verticalSliceTerrainActive || _verticalSliceTerrainWasActive || _terrainOcclusionHidden.Count > 0)
@@ -877,6 +892,7 @@ public partial class Game : Node3D
 
         var solidInstance = new MultiMeshInstance3D();
         solidInstance.Multimesh = mm;
+        solidInstance.MaterialOverride = CreateChunkSolidMaterial();
         AddChild(solidInstance);
         cv.Solid = solidInstance;
 
@@ -940,6 +956,30 @@ public partial class Game : Node3D
         _terrainMeshLayoutVersion++;
         _multimeshPeelStateToken = ulong.MaxValue;
         ApplyChunkFog(cv, chunkPos);
+    }
+
+    Material CreateChunkSolidMaterial()
+    {
+        if (_terrainSmartCutShader == null)
+        {
+            var fallback = new StandardMaterial3D
+            {
+                VertexColorUseAsAlbedo = true,
+                ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded
+            };
+            return fallback;
+        }
+
+        var mat = new ShaderMaterial();
+        mat.Shader = _terrainSmartCutShader;
+        mat.SetShaderParameter("u_fog_tint", Colors.White);
+        mat.SetShaderParameter("u_smart_cut_enabled", false);
+        mat.SetShaderParameter("u_cam_pos", Vector3.Zero);
+        mat.SetShaderParameter("u_focus_pos", Vector3.Zero);
+        mat.SetShaderParameter("u_cut_radius", CameraSmartCutRadius);
+        mat.SetShaderParameter("u_cut_fade", CameraSmartCutFadeWidth);
+        mat.SetShaderParameter("u_alpha_min", Mathf.Clamp(CameraSmartCutMinAlpha, 0f, 1f));
+        return mat;
     }
 
     void UnloadFarChunks()
@@ -1105,19 +1145,26 @@ public partial class Game : Node3D
             else
             {
                 cv.Solid.Visible = cv.Solid.Multimesh.InstanceCount > 0;
-                var mat = cv.Solid.MaterialOverride as StandardMaterial3D;
-                if (mat == null)
+                Color fogTint = visible ? Colors.White : new Color(0.5f, 0.42f, 0.36f);
+                if (cv.Solid.MaterialOverride is ShaderMaterial sm)
                 {
-                    // Même pipeline que le mesh : sinon les vertex colors du MultiMesh sont ignorées → tout gris.
-                    mat = new StandardMaterial3D
-                    {
-                        VertexColorUseAsAlbedo = true,
-                        ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded
-                    };
-                    cv.Solid.MaterialOverride = mat;
+                    sm.SetShaderParameter("u_fog_tint", fogTint);
                 }
-                // Teinte « hors ligne de vue » : assombrir sans tuer les marrons (éviter le gris boue).
-                mat.AlbedoColor = visible ? Colors.White : new Color(0.5f, 0.42f, 0.36f);
+                else
+                {
+                    var mat = cv.Solid.MaterialOverride as StandardMaterial3D;
+                    if (mat == null)
+                    {
+                        // Même pipeline que le mesh : sinon les vertex colors du MultiMesh sont ignorées → tout gris.
+                        mat = new StandardMaterial3D
+                        {
+                            VertexColorUseAsAlbedo = true,
+                            ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded
+                        };
+                        cv.Solid.MaterialOverride = mat;
+                    }
+                    mat.AlbedoColor = fogTint;
+                }
             }
         }
 
@@ -1298,6 +1345,112 @@ public partial class Game : Node3D
         _btnMineStone.Disabled = !canMine;
     }
 
+    bool TryGetColonistsFocusAverage(out Vector3 focus)
+    {
+        focus = Vector3.Zero;
+        if (selectionManager == null || selectionManager.SelectedColonists.Count == 0)
+            return false;
+        Vector3 sum = Vector3.Zero;
+        int count = 0;
+        foreach (var colon in selectionManager.SelectedColonists)
+        {
+            if (!colonVisuals.TryGetValue(colon, out var node) || !GodotObject.IsInstanceValid(node))
+                continue;
+            sum += node.GlobalPosition;
+            count++;
+        }
+        if (count == 0)
+            return false;
+        focus = sum / count;
+        return true;
+    }
+
+    /// <summary>Suivi caméra uniquement : colons / sélections stables — pas le survol souris.</summary>
+    bool TryGetCameraFollowPoint(out Vector3 focus)
+    {
+        focus = Vector3.Zero;
+        if (TryGetColonistsFocusAverage(out focus))
+            return true;
+
+        if (_selectedTreeTile.HasValue)
+        {
+            var c = _selectedTreeTile.Value;
+            focus = new Vector3(c.X + 0.5f, c.Y + 0.5f, c.Z + 0.5f);
+            return true;
+        }
+
+        if (_selectedTerrainTiles.Count > 0)
+        {
+            foreach (var c in _selectedTerrainTiles)
+            {
+                focus = new Vector3(c.X + 0.5f, c.Y + 0.5f, c.Z + 0.5f);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>Smart cut shader + occlusion : inclut le bloc sous le curseur pour voir à travers vers la cible.</summary>
+    bool TryGetSmartCutFocusPoint(out Vector3 focus)
+    {
+        focus = Vector3.Zero;
+        if (TryGetColonistsFocusAverage(out focus))
+            return true;
+
+        if (CameraSmartCutUseTerrainHover && _terrainHoverCell.HasValue)
+        {
+            var c = _terrainHoverCell.Value;
+            focus = new Vector3(c.X + 0.5f, c.Y + 0.5f, c.Z + 0.5f);
+            return true;
+        }
+
+        if (_selectedTreeTile.HasValue)
+        {
+            var c = _selectedTreeTile.Value;
+            focus = new Vector3(c.X + 0.5f, c.Y + 0.5f, c.Z + 0.5f);
+            return true;
+        }
+
+        if (_selectedTerrainTiles.Count > 0)
+        {
+            foreach (var c in _selectedTerrainTiles)
+            {
+                focus = new Vector3(c.X + 0.5f, c.Y + 0.5f, c.Z + 0.5f);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void UpdateSmartCutShaderParameters(bool hasFocus, Vector3 focus)
+    {
+        if (_chunkVisuals.Count == 0 || camera == null)
+            return;
+
+        Vector3 camPos = camera.GlobalPosition;
+        bool enabled = CameraSmartCutEnabled && hasFocus && camPos.DistanceTo(focus) <= Mathf.Max(2f, CameraSmartCutMaxDistance);
+
+        float radius = Mathf.Max(0.05f, CameraSmartCutRadius);
+        float fadeWidth = Mathf.Max(0.01f, CameraSmartCutFadeWidth);
+        float minAlpha = Mathf.Clamp(CameraSmartCutMinAlpha, 0f, 1f);
+
+        foreach (var pair in _chunkVisuals)
+        {
+            var solid = pair.Value.Solid;
+            if (solid?.MaterialOverride is not ShaderMaterial sm)
+                continue;
+
+            sm.SetShaderParameter("u_smart_cut_enabled", enabled);
+            sm.SetShaderParameter("u_cam_pos", camPos);
+            sm.SetShaderParameter("u_focus_pos", focus);
+            sm.SetShaderParameter("u_cut_radius", radius);
+            sm.SetShaderParameter("u_cut_fade", fadeWidth);
+            sm.SetShaderParameter("u_alpha_min", minAlpha);
+        }
+    }
+
     void ComputeTerrainOcclusionHiddenSet()
     {
         _terrainOcclusionHidden.Clear();
@@ -1306,27 +1459,49 @@ public partial class Game : Node3D
 
         // Alt est souvent capturé par Windows : Q = percée fiable. Alt physique en complément.
         bool wantPeel = Input.IsPhysicalKeyPressed(Key.Q) || Input.IsPhysicalKeyPressed(Key.Alt);
-        if (!wantPeel)
+        Vector3 smartFocus = Vector3.Zero;
+        bool useSmartCut = CameraSmartCutEnabled && TryGetSmartCutFocusPoint(out smartFocus);
+        if (!wantPeel && !useSmartCut)
             return;
 
         var from = camera.GlobalPosition;
-        var mouse = camera.GetViewport().GetMousePosition();
-        var dir = camera.ProjectRayNormal(mouse).Normalized();
+        Vector3 dir;
+        float rayMax = TerrainOcclusionRayMax;
+        if (useSmartCut && !wantPeel)
+        {
+            Vector3 toFocus = smartFocus - from;
+            float dist = toFocus.Length();
+            if (dist < 1e-4f || dist > Mathf.Max(4f, CameraSmartCutMaxDistance))
+                return;
+            dir = toFocus / dist;
+            rayMax = Mathf.Min(TerrainOcclusionRayMax, dist + 1.2f);
+        }
+        else
+        {
+            var mouse = camera.GetViewport().GetMousePosition();
+            dir = camera.ProjectRayNormal(mouse).Normalized();
+        }
 
-        TerrainRayDda.CollectOrderedSolidCellsAlongRay(sim.World.CurrentMap, TerrainOcclusionRayMax, from, dir, _raySolidBuffer, 0.35f);
+        TerrainRayDda.CollectOrderedSolidCellsAlongRay(sim.World.CurrentMap, TerrainOcclusionRayMax, from, dir, _raySolidBuffer, 0.35f, rayMax);
         if (_raySolidBuffer.Count < 2)
             return;
 
         var deepest = _raySolidBuffer[^1];
         var focusCenter = new Vector3(deepest.X + 0.5f, deepest.Y + 0.5f, deepest.Z + 0.5f);
-        if (from.DistanceTo(focusCenter) > TerrainOcclusionMaxCameraDistance)
-            return;
+        if (!useSmartCut || wantPeel)
+        {
+            if (from.DistanceTo(focusCenter) > TerrainOcclusionMaxCameraDistance)
+                return;
+            float cy = from.Y;
+            if (cy < TerrainOcclusionCameraMinY || cy > TerrainOcclusionCameraMaxY)
+                return;
+        }
 
-        float cy = from.Y;
-        if (cy < TerrainOcclusionCameraMinY || cy > TerrainOcclusionCameraMaxY)
-            return;
-
-        for (int i = 0; i < _raySolidBuffer.Count - 1; i++)
+        int keepLast = useSmartCut && !wantPeel
+            ? Mathf.Clamp(CameraSmartCutKeepLastSolids, 0, 6)
+            : 1;
+        int hideCount = Mathf.Max(0, _raySolidBuffer.Count - keepLast);
+        for (int i = 0; i < hideCount; i++)
             _terrainOcclusionHidden.Add(_raySolidBuffer[i]);
     }
 

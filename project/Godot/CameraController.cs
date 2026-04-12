@@ -6,13 +6,20 @@ public class CameraController
     Camera3D camera;
 
     bool rotating = false;
-    float speed = 10f;
+    float speed = 16f;
+    float panSmooth = 11f;
+    float followSmooth = 7.5f;
     float zoomStep = 2.5f;
     float zoomSmooth = 12f;
     float minZoom = 6f;
     float maxZoom = 45f;
     float targetZoom;
     Vector3 zoomDirection;
+    Vector3 targetPivotPos;
+    Vector3 focusPoint = Vector3.Zero;
+    bool hasFocusPoint;
+    /// <summary>False par défaut : sinon la caméra « suit » le focus (désormais stable, sans survol terrain).</summary>
+    bool followFocusEnabled = false;
 
     public CameraController(Node3D pivot , Camera3D camera)
     {
@@ -23,6 +30,13 @@ public class CameraController
         if (zoomDirection == Vector3.Zero)
             zoomDirection = new Vector3(0, 0.6f, 0.8f).Normalized();
         targetZoom = Mathf.Clamp(camera.Position.Length(), minZoom, maxZoom);
+        targetPivotPos = pivot.Position;
+    }
+
+    public void SetFocusPoint(Vector3 worldPoint, bool valid)
+    {
+        focusPoint = worldPoint;
+        hasFocusPoint = valid;
     }
 
     public void Update(double delta)
@@ -55,10 +69,26 @@ public class CameraController
         if (Input.IsActionPressed("camera_down"))
             move += Vector3.Down;
 
-        pivot.Position += move * speed * (float)delta;
+        float dt = (float)delta;
+        if (move != Vector3.Zero)
+        {
+            move = move.Normalized();
+            float zoom01 = Mathf.Clamp((targetZoom - minZoom) / Mathf.Max(0.001f, maxZoom - minZoom), 0f, 1f);
+            float zoomSpeedFactor = Mathf.Lerp(0.65f, 1.45f, zoom01);
+            targetPivotPos += move * speed * zoomSpeedFactor * dt;
+        }
+
+        if (followFocusEnabled && hasFocusPoint)
+        {
+            float tf = Mathf.Clamp(dt * followSmooth, 0f, 1f);
+            targetPivotPos = targetPivotPos.Lerp(focusPoint, tf);
+        }
+
+        float tp = Mathf.Clamp(dt * panSmooth, 0f, 1f);
+        pivot.Position = pivot.Position.Lerp(targetPivotPos, tp);
 
         float currentZoom = camera.Position.Length();
-        float t = Mathf.Clamp((float)delta * zoomSmooth, 0f, 1f);
+        float t = Mathf.Clamp(dt * zoomSmooth, 0f, 1f);
         float smoothedZoom = Mathf.Lerp(currentZoom, targetZoom, t);
         camera.Position = zoomDirection * smoothedZoom;
     }
@@ -79,6 +109,20 @@ public class CameraController
         if (@event is InputEventMouseMotion motion && rotating)
         {
             pivot.RotateY(-motion.Relative.X * 0.01f);
+        }
+
+        // F8 = souvent « arrêter le jeu » dans l’éditeur Godot — utiliser une autre touche.
+        if (@event is InputEventKey key && key.Pressed && !key.Echo)
+        {
+            if (key.PhysicalKeycode == Key.J || key.Keycode == Key.J)
+            {
+                followFocusEnabled = !followFocusEnabled;
+                if (!followFocusEnabled)
+                    targetPivotPos = pivot.Position;
+                GD.Print(followFocusEnabled
+                    ? "[Camera] Suivi de la cible ON (touche J)"
+                    : "[Camera] Suivi de la cible OFF (touche J)");
+            }
         }
     }
 }
