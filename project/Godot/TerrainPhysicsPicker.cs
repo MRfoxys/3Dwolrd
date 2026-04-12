@@ -6,7 +6,7 @@ public static class TerrainPhysicsPicker
 {
     public const uint TerrainPickCollisionMask = 1u;
 
-    /// <summary>Si le hit tombe sur une cellule que <paramref name="acceptSolidCell"/> refuse (ex. masquée par la coupe V), le rayon avance.</summary>
+    /// <summary>Si le hit tombe sur une cellule que <paramref name="acceptSolidCell"/> refuse, le rayon avance.</summary>
     public static bool TryPickCell(
         PhysicsDirectSpaceState3D space,
         Map map,

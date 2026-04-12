@@ -565,6 +565,172 @@ public partial class Game : Node3D
         return t != null && t.Solid;
     }
 
+    ulong _terrainPickVisibilityCacheToken = ulong.MaxValue;
+    readonly Dictionary<Vector3I, bool> _terrainPickHiddenCache = new();
+
+    bool IsTerrainCellPickHiddenRaw(Vector3I cell) =>
+        _terrainOcclusionHidden.Contains(cell)
+        || (_verticalSliceTerrainActive && IsTerrainCellHiddenByVerticalSlice(cell));
+
+    void RefreshTerrainPickVisibilityCacheIfNeeded()
+    {
+        ulong token = ComputeMultimeshPeelStateToken();
+        if (token == _terrainPickVisibilityCacheToken)
+            return;
+
+        _terrainPickVisibilityCacheToken = token;
+        _terrainPickHiddenCache.Clear();
+        foreach (var pair in _chunkVisuals)
+        {
+            var cv = pair.Value;
+            foreach (var kv in cv.SolidInstanceByWorld)
+                _terrainPickHiddenCache[kv.Key] = IsTerrainCellPickHiddenRaw(kv.Key);
+        }
+    }
+
+    /// <summary>Cellule masquée par la coupe V ou la percée Q — cache booléen aligné sur le token peel (pas de rebuild mesh).</summary>
+    bool IsTerrainCellPickHidden(Vector3I cell)
+    {
+        if (!_verticalSliceTerrainActive && _terrainOcclusionHidden.Count == 0)
+            return false;
+        RefreshTerrainPickVisibilityCacheIfNeeded();
+        if (_terrainPickHiddenCache.TryGetValue(cell, out bool hidden))
+            return hidden;
+        return IsTerrainCellPickHiddenRaw(cell);
+    }
+
+    bool IsTerrainFaceExposedForPick(Map map, Vector3I cell, Vector3I faceNormal)
+    {
+        Vector3I neighbor = cell + faceNormal;
+        if (!IsWorldTileSolidForPick(map, neighbor.X, neighbor.Y, neighbor.Z))
+            return true;
+        return IsTerrainCellPickHidden(neighbor);
+    }
+
+    bool TryAcceptEnteredCellFace(Map map, Vector3I cell, Vector3 dir, int nx, int ny, int nz, bool preferSideFaces)
+    {
+        if (nx == 0 && ny == 0 && nz == 0)
+            return false;
+
+        bool AcceptNormal(Vector3I n)
+        {
+            if (new Vector3(n.X, n.Y, n.Z).Dot(dir) >= -0.01f)
+                return false;
+            return IsTerrainFaceExposedForPick(map, cell, n);
+        }
+
+        bool xOk = nx != 0 && AcceptNormal(new Vector3I(nx, 0, 0));
+        bool zOk = nz != 0 && AcceptNormal(new Vector3I(0, 0, nz));
+        if (xOk || zOk)
+            return true;
+
+        if (preferSideFaces)
+            return false;
+
+        if (ny != 0 && AcceptNormal(new Vector3I(0, ny, 0)))
+            return true;
+        return false;
+    }
+
+    /// <summary>DDA face-aware : choisit la première cellule solide visible dont la face d'entrée est exposée dans le monde coupé.</summary>
+    bool TryPickTerrainVisibleFaceDda(Vector3 from, Vector3 dirNormalized, float rayLength, out Vector3I pick)
+    {
+        pick = default;
+        var map = sim?.World?.CurrentMap;
+        if (map == null)
+            return false;
+
+        Vector3 dir = dirNormalized;
+        if (dir.LengthSquared() < 1e-12f)
+            return false;
+        dir = dir.Normalized();
+
+        RefreshTerrainPickVisibilityCacheIfNeeded();
+        bool preferSideFaces = _verticalSliceTerrainActive && VerticalSliceUseVerticalCut;
+
+        // DDA sur voxels centrés aux entiers : on translate de +0.5 pour travailler dans une grille "coin entier".
+        Vector3 rayOrigin = from + dir * 1e-4f + new Vector3(0.5f, 0.5f, 0.5f);
+        int cx = Mathf.FloorToInt(rayOrigin.X);
+        int cy = Mathf.FloorToInt(rayOrigin.Y);
+        int cz = Mathf.FloorToInt(rayOrigin.Z);
+
+        float dx = dir.X, dy = dir.Y, dz = dir.Z;
+        const float eps = 1e-8f;
+        int stepX = dx > eps ? 1 : (dx < -eps ? -1 : 0);
+        int stepY = dy > eps ? 1 : (dy < -eps ? -1 : 0);
+        int stepZ = dz > eps ? 1 : (dz < -eps ? -1 : 0);
+
+        float tDeltaX = stepX != 0 ? Mathf.Abs(1f / dx) : float.MaxValue;
+        float tDeltaY = stepY != 0 ? Mathf.Abs(1f / dy) : float.MaxValue;
+        float tDeltaZ = stepZ != 0 ? Mathf.Abs(1f / dz) : float.MaxValue;
+
+        float tMaxX = stepX > 0 ? ((cx + 1) - rayOrigin.X) / dx
+            : stepX < 0 ? (rayOrigin.X - cx) / (-dx) : float.MaxValue;
+        float tMaxY = stepY > 0 ? ((cy + 1) - rayOrigin.Y) / dy
+            : stepY < 0 ? (rayOrigin.Y - cy) / (-dy) : float.MaxValue;
+        float tMaxZ = stepZ > 0 ? ((cz + 1) - rayOrigin.Z) / dz
+            : stepZ < 0 ? (rayOrigin.Z - cz) / (-dz) : float.MaxValue;
+
+        float maxTravel = Mathf.Max(0f, rayLength);
+        float traveled = 0f;
+        const int maxSteps = 8192;
+        int entryNx = 0, entryNy = 0, entryNz = 0;
+
+        for (int step = 0; step < maxSteps; step++)
+        {
+            if (traveled > maxTravel)
+                break;
+
+            var cell = new Vector3I(cx, cy, cz);
+            if ((new Vector3(cell.X + 0.5f, cell.Y + 0.5f, cell.Z + 0.5f) - from).Length() > rayLength + 1f)
+                break;
+
+            var tile = map.GetTile(cell);
+            if (tile != null && tile.Solid && !IsTerrainCellPickHidden(cell))
+            {
+                if (TryAcceptEnteredCellFace(map, cell, dir, entryNx, entryNy, entryNz, preferSideFaces))
+                {
+                    pick = cell;
+                    return true;
+                }
+            }
+
+            float tStep = Mathf.Min(tMaxX, Mathf.Min(tMaxY, tMaxZ));
+            if (float.IsNaN(tStep) || tStep >= float.MaxValue * 0.5f)
+                break;
+            if (traveled + tStep > maxTravel)
+                break;
+            traveled += tStep;
+
+            float tieTol = 1e-5f * (1f + Mathf.Abs(tStep));
+            bool stepOnX = tMaxX <= tStep + tieTol;
+            bool stepOnY = tMaxY <= tStep + tieTol;
+            bool stepOnZ = tMaxZ <= tStep + tieTol;
+            entryNx = entryNy = entryNz = 0;
+
+            if (stepOnX)
+            {
+                tMaxX += tDeltaX;
+                cx += stepX;
+                entryNx = -stepX;
+            }
+            if (stepOnY)
+            {
+                tMaxY += tDeltaY;
+                cy += stepY;
+                entryNy = -stepY;
+            }
+            if (stepOnZ)
+            {
+                tMaxZ += tDeltaZ;
+                cz += stepZ;
+                entryNz = -stepZ;
+            }
+        }
+
+        return false;
+    }
+
     static void AddCollisionTri(List<Vector3> v, Vector3 a, Vector3 b, Vector3 c)
     {
         v.Add(a);
@@ -572,6 +738,7 @@ public partial class Game : Node3D
         v.Add(c);
     }
 
+    /// <summary>Collision picking statique (map seule) ; coupe / Q gérées par <see cref="TerrainPhysicsPicker"/> via prédicat léger.</summary>
     void BuildAndAttachChunkTerrainPickBody(Chunk chunk, Vector3I chunkPos, Map map, ChunkVisual cv)
     {
         int cs = Map.CHUNK_SIZE;
@@ -579,7 +746,6 @@ public partial class Game : Node3D
         int oy = chunkPos.Y * cs;
         int oz = chunkPos.Z * cs;
         var verts = new List<Vector3>(16384);
-        // Même convention que le MultiMesh : cube 1×1×1 centré sur (wx, wy, wz), pas sur le coin bas.
         const float h = 0.5f;
 
         for (int lx = 0; lx < cs; lx++)
@@ -637,7 +803,6 @@ public partial class Game : Node3D
             return;
 
         var shape = new ConcavePolygonShape3D { Data = verts.ToArray() };
-
         var body = new StaticBody3D
         {
             CollisionLayer = TerrainPhysicsPicker.TerrainPickCollisionMask,
@@ -1093,16 +1258,16 @@ public partial class Game : Node3D
             _terrainOcclusionHidden.Add(_raySolidBuffer[i]);
     }
 
-    /// <summary>Repli sans physique : solides rencontrés le long du rayon (ordre DDA). Filtré par la coupe V si active.</summary>
+    /// <summary>Repli sans physique : solides le long du rayon, même filtre que le mesh de picking (coupe + Q).</summary>
     List<Vector3I> BuildTerrainFallbackPickList(Vector3 from, Vector3 dir, float rayLen)
     {
         TerrainRayDda.CollectOrderedSolidCellsAlongRay(sim.World.CurrentMap, TerrainOcclusionRayMax, from, dir, _raySolidBuffer, 0f, rayLen);
-        if (!_verticalSliceTerrainActive)
+        if (!_verticalSliceTerrainActive && _terrainOcclusionHidden.Count == 0)
             return _raySolidBuffer;
         _raySolidPickBuffer.Clear();
         foreach (var c in _raySolidBuffer)
         {
-            if (!IsTerrainCellHiddenByVerticalSlice(c))
+            if (!IsTerrainCellPickHidden(c))
                 _raySolidPickBuffer.Add(c);
         }
         return _raySolidPickBuffer;
@@ -1337,7 +1502,10 @@ public partial class Game : Node3D
         bool wantPeel = respectPeelModifierKeys
             && (Input.IsPhysicalKeyPressed(Key.Q) || Input.IsPhysicalKeyPressed(Key.Alt));
 
-        bool pickedPhysics = TerrainPickUsePhysicsRaycast && !wantPeel
+        bool pickedSliceFaceDda = _verticalSliceTerrainActive && !wantPeel
+            && TryPickTerrainVisibleFaceDda(from, dir, pickRayLen, out pick);
+
+        bool pickedPhysics = !pickedSliceFaceDda && TerrainPickUsePhysicsRaycast && !wantPeel
             && TerrainPhysicsPicker.TryPickCell(
                 camera.GetWorld3D().DirectSpaceState,
                 sim.World.CurrentMap,
@@ -1345,10 +1513,10 @@ public partial class Game : Node3D
                 dir,
                 pickRayLen,
                 TerrainPhysicsPicker.TerrainPickCollisionMask,
-                c => !_verticalSliceTerrainActive || !IsTerrainCellHiddenByVerticalSlice(c),
+                c => !IsTerrainCellPickHidden(c),
                 out pick);
 
-        if (!pickedPhysics)
+        if (!pickedPhysics && !pickedSliceFaceDda)
         {
             List<Vector3I> ordered = BuildTerrainFallbackPickList(from, dir, pickRayLen);
             if (ordered.Count == 0)
