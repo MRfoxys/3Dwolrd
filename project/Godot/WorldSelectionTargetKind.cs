@@ -8,4 +8,6 @@ public enum WorldSelectionTargetKind
     Trees,
     /// <summary>Sélection de tuile (minage / ordres au sol) — utilise la percée Alt pour viser au fond.</summary>
     TerrainTiles,
+    /// <summary>Placement de blocs de construction (preview transparent + pose au clic).</summary>
+    BuildBlocks,
 }

@@ -99,10 +99,10 @@ public class CameraController
         {
             if (mouse.ButtonIndex == MouseButton.Middle)
                 rotating = mouse.Pressed;
-            if (mouse.ButtonIndex == MouseButton.WheelUp)
+            if (!mouse.ShiftPressed && mouse.ButtonIndex == MouseButton.WheelUp)
                 targetZoom = Mathf.Clamp(targetZoom - zoomStep, minZoom, maxZoom);
 
-            if (mouse.ButtonIndex == MouseButton.WheelDown)
+            if (!mouse.ShiftPressed && mouse.ButtonIndex == MouseButton.WheelDown)
                 targetZoom = Mathf.Clamp(targetZoom + zoomStep, minZoom, maxZoom);
         }
 

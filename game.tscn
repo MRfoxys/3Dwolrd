@@ -11,10 +11,12 @@ ambient_light_energy = 0.45
 
 [node name="Game" type="Node3D" unique_id=230355190]
 script = ExtResource("1_80nbo")
+CameraSmartCutUseTerrainHover = true
 VerticalSliceInvertVisibility = true
 VerticalSliceHideBehindCameraSide = true
 VerticalSliceForwardCutDepth = 0.1
 VerticalSliceScreenBottomHideFraction = 0.09
+VoxelDragMaxCells = 4096
 
 [node name="CameraPivot" type="Node3D" parent="." unique_id=751720371]
 
@@ -87,6 +89,12 @@ text = "Miner ce bloc (pierre ou sol)"
 [node name="TerrainTileLabel" type="Label" parent="UI/SelectionPanel/VBox" unique_id=549314307]
 layout_mode = 2
 text = "Tuile : (aucune)"
+autowrap_mode = 2
+
+[node name="BuildStatusLabel" type="Label" parent="UI/SelectionPanel/VBox" unique_id=489201572]
+visible = false
+layout_mode = 2
+theme_override_colors/font_color = Color(0.55, 0.78, 1, 1)
 autowrap_mode = 2
 
 [node name="HintLabel" type="Label" parent="UI/SelectionPanel/VBox" unique_id=1750261864]

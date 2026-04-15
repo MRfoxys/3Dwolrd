@@ -6,6 +6,7 @@ public class Map
 {
     public Dictionary<Vector3I, Chunk> Chunks = new();
     public List<Colonist> Colonists = new();
+    readonly HashSet<Vector3I> _modifiedTiles = new();
 
     public const int CHUNK_SIZE = 16;
 
@@ -15,7 +16,6 @@ public class Map
     /// <summary>Couche d'air où les colons se déplacent (au-dessus du sol solide en y=11).</summary>
     public const int ColonistWalkY = 12;
 
-    public Random random;
     public int WorldSeed { get; }
 
     // =========================
@@ -57,19 +57,33 @@ public class Map
     public Map(int seed = 42) // Seed par défaut = 42 (peut être changé)
     {
         WorldSeed = seed;
-        random = new Random(seed);
     }
 
     public void SetTile(Vector3I worldPos, Tile tile)
     {
         var chunk = GetChunk(worldPos);
         var local = WorldToLocal(worldPos);
-        chunk.Tiles[local.X, local.Y, local.Z] = tile;
+        var nextTile = tile ?? new Tile();
+        chunk.Tiles[local.X, local.Y, local.Z] = nextTile;
+
+        var generated = GetGeneratedTile(worldPos);
+        if (TilesEqual(nextTile, generated))
+            _modifiedTiles.Remove(worldPos);
+        else
+            _modifiedTiles.Add(worldPos);
     }
 
     public bool HasTile(Vector3I pos)
     {
         return GetTile(pos) != null;
+    }
+
+    public IReadOnlyCollection<Vector3I> GetModifiedTiles() => _modifiedTiles;
+
+    public void ResetGeneratedWorldState()
+    {
+        Chunks.Clear();
+        _modifiedTiles.Clear();
     }
 
     // =========================
@@ -130,76 +144,92 @@ public class Map
             int worldX = chunkPos.X * CHUNK_SIZE + x;
             int worldY = chunkPos.Y * CHUNK_SIZE + y;
             int worldZ = chunkPos.Z * CHUNK_SIZE + z;
+            chunk.Tiles[x, y, z] = GenerateTileAtWorldPosition(worldX, worldY, worldZ);
+        }
 
-            var tile = new Tile();
+        return chunk;
+    }
 
-            // 🌍 SEULEMENT y=0 est du sol (ground)
-            if (worldY == 0)
-            {
-                tile.Type = "ground";
-                tile.Solid = true;
-            }
-            // 🏔️ Entre y=1 et y=10 : masse de pierre + cavités (bruit 3D cohérent)
-            else if (worldY > 0 && worldY <= 10)
-            {
-                float cave = TerrainNoise.Sample3D(
-                    worldX * 0.11f,
-                    worldY * 0.10f,
-                    worldZ * 0.11f,
-                    WorldSeed);
+    public Tile GetGeneratedTile(Vector3I worldPos) =>
+        GenerateTileAtWorldPosition(worldPos.X, worldPos.Y, worldPos.Z);
 
-                // Seuil plus haut = plus de grottes / tunnels reliés
-                if (cave > 0.56f)
-                {
-                    tile.Type = "air";
-                    tile.Solid = false;
-                }
-                else
-                {
-                    tile.Type = "stone";
-                    tile.Solid = true;
-                }
-            }
-            // 🛠️ Sol de jeu : plateforme (les colons marchent dans la couche d'air au-dessus)
-            else if (worldY == WorldFloorY)
-            {
-                tile.Type = "platform";
-                tile.Solid = true;
-            }
-            // 🌌 Au-dessus du sol de jeu : air
-            else
+    Tile GenerateTileAtWorldPosition(int worldX, int worldY, int worldZ)
+    {
+        var tile = new Tile();
+
+        // 🌍 SEULEMENT y=0 est du sol (ground)
+        if (worldY == 0)
+        {
+            tile.Type = "ground";
+            tile.Solid = true;
+        }
+        // 🏔️ Entre y=1 et y=10 : masse de pierre + cavités (bruit 3D cohérent)
+        else if (worldY > 0 && worldY <= 10)
+        {
+            float cave = TerrainNoise.Sample3D(
+                worldX * 0.11f,
+                worldY * 0.10f,
+                worldZ * 0.11f,
+                WorldSeed);
+
+            // Seuil plus haut = plus de grottes / tunnels reliés
+            if (cave > 0.56f)
             {
                 tile.Type = "air";
                 tile.Solid = false;
             }
-
-            chunk.Tiles[x, y, z] = tile;
+            else
+            {
+                tile.Type = "stone";
+                tile.Solid = true;
+            }
+        }
+        // 🛠️ Sol de jeu : plateforme (les colons marchent dans la couche d'air au-dessus)
+        else if (worldY == WorldFloorY)
+        {
+            tile.Type = "platform";
+            tile.Solid = true;
+        }
+        // 🌌 Au-dessus du sol de jeu : air
+        else
+        {
+            tile.Type = "air";
+            tile.Solid = false;
         }
 
-        // 🌳 Arbres sur la surface de jeu (même hauteur que la plateforme), pas sur le bedrock y=0
+        // 🌳 Arbres en surface avec bruit + hash déterministe (indépendant de l'ordre de génération des chunks)
         const int treeSalt = 913_517;
-        int floorLocalY = WorldFloorY - chunkPos.Y * CHUNK_SIZE;
-        if (floorLocalY >= 0 && floorLocalY < CHUNK_SIZE)
+        if (worldY == WorldFloorY && tile.Type == "platform")
         {
-            for (int x = 0; x < CHUNK_SIZE; x++)
-            for (int z = 0; z < CHUNK_SIZE; z++)
+            float scatter = TerrainNoise.Sample3D(worldX * 0.27f, WorldFloorY * 0.07f, worldZ * 0.27f, WorldSeed + treeSalt);
+            float chance = Deterministic01(worldX, worldZ, WorldSeed + treeSalt * 3);
+            if (scatter > 0.82f && chance < 0.4f)
             {
-                var floorTile = chunk.Tiles[x, floorLocalY, z];
-                if (floorTile == null || floorTile.Type != "platform")
-                    continue;
-
-                int wx = chunkPos.X * CHUNK_SIZE + x;
-                int wz = chunkPos.Z * CHUNK_SIZE + z;
-                float scatter = TerrainNoise.Sample3D(wx * 0.27f, WorldFloorY * 0.07f, wz * 0.27f, WorldSeed + treeSalt);
-                if (scatter > 0.82f && random.NextDouble() < 0.4)
-                {
-                    floorTile.Type = "tree";
-                    floorTile.Solid = true;
-                }
+                tile.Type = "tree";
+                tile.Solid = true;
             }
         }
 
-        return chunk;
+        return tile;
+    }
+
+    static float Deterministic01(int x, int z, int seed)
+    {
+        unchecked
+        {
+            uint h = 2166136261u;
+            h = (h ^ (uint)x) * 16777619u;
+            h = (h ^ (uint)z) * 16777619u;
+            h = (h ^ (uint)seed) * 16777619u;
+            return (h & 0x00FFFFFFu) / 16777216f;
+        }
+    }
+
+    static bool TilesEqual(Tile a, Tile b)
+    {
+        if (a == null || b == null)
+            return a == b;
+        return a.Solid == b.Solid && string.Equals(a.Type, b.Type, StringComparison.Ordinal);
     }
 
     public Chunk GenerateFlatChunk(Vector3I chunkPos)

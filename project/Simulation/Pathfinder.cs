@@ -6,19 +6,26 @@ public class Pathfinder
 {
     Func<Vector3I, bool> isOccupied;
     Func<Vector3I, Tile> getTile;
+    Func<Vector3I, bool> hasVirtualScaffold;
 
     Vector3I[] directions = new Vector3I[]
     {
         new(1,0,0),
         new(-1,0,0),
         new(0,0,1),
-        new(0,0,-1)
+        new(0,0,-1),
+        new(1,0,1),
+        new(1,0,-1),
+        new(-1,0,1),
+        new(-1,0,-1)
     };
+    readonly Vector3I[] verticalDirections = { new(0, 1, 0), new(0, -1, 0), };
 
-    public Pathfinder(Func<Vector3I, Tile> getTile, Func<Vector3I,bool> isOccupied)
+    public Pathfinder(Func<Vector3I, Tile> getTile, Func<Vector3I,bool> isOccupied, Func<Vector3I, bool> hasVirtualScaffold = null)
     {
         this.getTile = getTile;
         this.isOccupied = isOccupied;
+        this.hasVirtualScaffold = hasVirtualScaffold;
     }
 
     class Node
@@ -51,11 +58,15 @@ public class Pathfinder
         if (IsSolid(p))
             return false;
 
+        if (HasScaffoldAt(p))
+            return true;
+
         // ✅ sol obligatoire juste en dessous
         if (p.Y == 0)
             return true;
 
-        return IsSolid(p + new Vector3I(0, -1, 0));
+        var below = p + new Vector3I(0, -1, 0);
+        return IsSolid(below) || HasScaffoldAt(below);
 
     }
 
@@ -142,6 +153,8 @@ public class Pathfinder
                     continue;
 
                 var nextPos = validPos.Value;
+                if (IsDiagonalXz(dir) && !CanPassDiagonalCorner(current.Pos, dir))
+                    continue;
 
                 // Occupied cells are treated as blocked to avoid unstable detours
                 // and "zigzag" replanning around moving units.
@@ -149,7 +162,7 @@ public class Pathfinder
                     continue;
 
                 // 🟨 coût de déplacement
-                int cost = 1;
+                int cost = IsDiagonalXz(dir) ? 2 : 1;
 
                 // monter = plus cher
                 if (nextPos.Y > current.Pos.Y)
@@ -176,6 +189,40 @@ public class Pathfinder
 
                 // 🔍 DEBUG (optionnel)
                 // GD.Print("FROM ", current.Pos, " TO ", nextPos);
+            }
+
+            // Mouvement vertical "échelle": autorisé uniquement si un scaffold relie
+            // la case courante et la case cible.
+            foreach (var vdir in verticalDirections)
+            {
+                var nextPos = current.Pos + vdir;
+                if (!InBounds(nextPos))
+                    continue;
+                if (!Walkable(nextPos))
+                    continue;
+                if (!CanClimbScaffoldBetween(current.Pos, nextPos))
+                    continue;
+                if (isOccupied != null && isOccupied(nextPos))
+                    continue;
+
+                int cost = 2;
+                int newG = current.G + cost;
+                if (visited.TryGetValue(nextPos, out var existing))
+                {
+                    if (newG >= existing.G)
+                        continue;
+                }
+
+                var node = new Node
+                {
+                    Pos = nextPos,
+                    G = newG,
+                    H = Heuristic(nextPos, end),
+                    Parent = current
+                };
+
+                visited[nextPos] = node;
+                open.Enqueue(node, node.F);
             }
         }
 
@@ -236,5 +283,39 @@ public class Pathfinder
             return false;
 
         return getTile(p).Solid;
+    }
+
+    bool HasScaffoldAt(Vector3I p)
+    {
+        return hasVirtualScaffold != null && hasVirtualScaffold(p);
+    }
+
+    static bool IsDiagonalXz(Vector3I dir)
+    {
+        return Mathf.Abs(dir.X) == 1 && Mathf.Abs(dir.Z) == 1;
+    }
+
+    bool CanPassDiagonalCorner(Vector3I current, Vector3I dir)
+    {
+        var sideX = current + new Vector3I(dir.X, 0, 0);
+        var sideZ = current + new Vector3I(0, 0, dir.Z);
+
+        // Empêche la coupe de coin à travers deux murs collés.
+        if (IsSolid(sideX))
+            return false;
+        if (IsSolid(sideZ))
+            return false;
+
+        return true;
+    }
+
+    bool CanClimbScaffoldBetween(Vector3I from, Vector3I to)
+    {
+        if (Mathf.Abs(to.Y - from.Y) != 1 || from.X != to.X || from.Z != to.Z)
+            return false;
+
+        var fromBelow = from + new Vector3I(0, -1, 0);
+        var toBelow = to + new Vector3I(0, -1, 0);
+        return HasScaffoldAt(from) || HasScaffoldAt(to) || HasScaffoldAt(fromBelow) || HasScaffoldAt(toBelow);
     }
 }

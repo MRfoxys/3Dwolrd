@@ -12,6 +12,7 @@ public class UnitController
     LockstepManager lockstep;
     Camera3D camera;
     Node uiRoot;
+    int localPlayerId;
     readonly TryPickMoveAnchorDelegate tryPickMoveAnchor;
     PopupMenu interactionMenu;
     Vector3I pendingTarget = Vector3I.Zero;
@@ -23,12 +24,14 @@ public class UnitController
         LockstepManager lockstep,
         Camera3D camera,
         Node uiRoot,
+        int localPlayerId,
         TryPickMoveAnchorDelegate tryPickMoveAnchor)
     {
         this.sim = sim;
         this.lockstep = lockstep;
         this.camera = camera;
         this.uiRoot = uiRoot;
+        this.localPlayerId = localPlayerId;
         this.tryPickMoveAnchor = tryPickMoveAnchor;
         BuildInteractionMenu();
     }
@@ -91,14 +94,15 @@ public class UnitController
             var cmd = new PlayerCommand
             {
                 Tick = sim.Tick + 1,
-                Type = "MOVE",
+                Type = PlayerCommandType.Move,
+                PlayerId = localPlayerId,
                 EntityId = index,
                 X = finalTarget.X,
                 Y = finalTarget.Y,
                 Z = finalTarget.Z
             };
 
-            lockstep.AddCommand(cmd);
+            lockstep.SubmitLocalCommand(cmd);
         }
     }
 

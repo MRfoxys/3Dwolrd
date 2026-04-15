@@ -11,10 +11,12 @@ public class SimulationFacade
 
     public void Step()
     {
+        lockstep.AdvanceToTick(simulation.Tick);
         var cmds = lockstep.GetCommandsForTick(simulation.Tick);
         foreach (var cmd in cmds)
             simulation.CommandQueue.Enqueue(cmd);
 
         simulation.Update();
+        lockstep.PublishLocalSnapshot(simulation.CaptureSnapshot());
     }
 }

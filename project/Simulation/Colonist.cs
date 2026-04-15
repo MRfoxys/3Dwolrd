@@ -17,6 +17,8 @@ public class Colonist
     public bool HasPathFailed = false;
     public List<Vector3I> Path = new();
     public SimJob ActiveJob;
+    /// <summary>Après un bloc de chantier : retour obligatoire vers cette case avant un nouveau job.</summary>
+    public Vector3I? PostBuildRallyCell;
 
     public Colonist()
     {

@@ -6,6 +6,8 @@ using System.Diagnostics;
 public partial class Game : Node3D
 {
     const int CHUNK_VISIBILITY_INTERVAL_TICKS = 1;
+    /// <summary>Tuile posée par le mode Build : même identifiant pour le job, le mesh terrain et la couleur du fantôme.</summary>
+    const string BuildPlacementTileType = "build_black";
 
     [Export] public Simulation sim = new Simulation();
     LockstepManager lockstep = new LockstepManager();
@@ -103,6 +105,21 @@ public partial class Game : Node3D
     [Export] public float TerrainHoverHighlightAmount = 0.38f;
     [Export] public Color TerrainMineHoverHighlightMix = new Color(0.35f, 1f, 0.45f, 1f);
     [Export] public float TerrainMineHoverHighlightAmount = 0.48f;
+    [Export] public float TerrainMineDragMaxClickPixels = 12f;
+    [Export(PropertyHint.Range, "1,4096,1")]
+    public int VoxelDragMaxCells = 512;
+    [Export] public Color TerrainDragLinePreviewMix = new Color(0.55f, 0.75f, 1f, 1f);
+    [Export] public float TerrainDragLinePreviewAmount = 0.42f;
+    [ExportGroup("Construction")]
+    [Export(PropertyHint.Range, "0.05,1,0.01")]
+    public float BuildPreviewGhostAlpha = 0.38f;
+    [Export] public bool ShowVirtualScaffolds = true;
+    [Export(PropertyHint.Range, "0.05,1,0.01")]
+    public float VirtualScaffoldAlpha = 0.3f;
+    [Export] public Key BuildLayerUpKey = Key.Pageup;
+    [Export] public Key BuildLayerDownKey = Key.Pagedown;
+    [Export] public Key BuildDepthUpKey = Key.R;
+    [Export] public Key BuildDepthDownKey = Key.F;
 
     HashSet<Vector3I> currentNeededChunks = new();
 
@@ -118,6 +135,15 @@ public partial class Game : Node3D
     WorldSelectionTargetKind _selectionTargetKind = WorldSelectionTargetKind.Colonists;
     Vector3I? _selectedTreeTile;
     readonly HashSet<Vector3I> _selectedTerrainTiles = new();
+    bool _terrainMineDragTracking;
+    Vector2 _terrainMineDragStartScreen;
+    Vector3I? _terrainMineDragStartCell;
+    readonly HashSet<Vector3I> _terrainMineDragPreview = new();
+    readonly List<Vector3I> _terrainLineBuffer = new();
+    readonly List<Vector3I> _mineSelectionSortBuffer = new();
+    readonly List<Vector3I> _orderedVoxelSelectionBuffer = new();
+    readonly List<Vector3I> _queuedBuildTargetsBuffer = new();
+    int _lastBuildQueuedPreviewRefreshTick = -1;
     bool _verticalSliceTerrainActive;
     bool _verticalSliceTerrainWasActive;
     /// <summary>Invalide le cache peel quand chunks ajoutés/retirés ou options coupe changent.</summary>
@@ -153,14 +179,36 @@ public partial class Game : Node3D
     Button _btnCutTree;
     Button _btnMineStone;
     Button _btnTerrainTiles;
+    MeshInstance3D _buildPreviewGhost;
+    StandardMaterial3D _buildPreviewMaterial;
+    Vector3I? _buildPreviewCell;
+    MultiMeshInstance3D _buildDragPreview;
+    StandardMaterial3D _buildDragPreviewMaterial;
+    MultiMeshInstance3D _buildQueuedPreview;
+    StandardMaterial3D _buildQueuedPreviewMaterial;
+    MultiMeshInstance3D _virtualScaffoldPreview;
+    StandardMaterial3D _virtualScaffoldPreviewMaterial;
+    int _lastVirtualScaffoldPreviewVersion = -1;
+    bool _lastVirtualScaffoldPreviewVisible;
+    int _buildSelectionLayerY = Map.ColonistWalkY;
+    bool _buildSelectionLayerInitialized;
+    int _buildExtrudeDepth = 1;
+    bool _ignoreNextLeftReleaseAfterCancel;
     Label _jobsQueueLabel;
+    Label _logisticsLabel;
     Label _terrainTileLabel;
+    Label _buildStatusLabel;
     readonly List<SimJob> _jobsUiBuffer = new();
 
     private Simulation _simulation;
     private PlayerController _playerController;
     private PlayerCommands _playerCommands;
     private MapRenderer _mapRenderer;
+    GameCommandPipelineModule _commandPipeline;
+    GameUiModule _uiModule;
+    GameViewModule _viewModule;
+    GameSelectionModule _selectionModule;
+    GameInputModule _inputModule;
 
 
     public override void _Ready()
@@ -190,7 +238,18 @@ public partial class Game : Node3D
         _btnMineStone = GetNodeOrNull<Button>("UI/SelectionPanel/VBox/BtnMineStone");
         _btnTerrainTiles = GetNodeOrNull<Button>("UI/SelectionPanel/VBox/ModeRow/BtnTerrainTiles");
         _jobsQueueLabel = GetNodeOrNull<Label>("UI/SelectionPanel/VBox/JobsQueueLabel");
+        _logisticsLabel = GetNodeOrNull<Label>("UI/SelectionPanel/VBox/LogisticsLabel");
         _terrainTileLabel = GetNodeOrNull<Label>("UI/SelectionPanel/VBox/TerrainTileLabel");
+        _buildStatusLabel = GetNodeOrNull<Label>("UI/SelectionPanel/VBox/BuildStatusLabel");
+        if (_logisticsLabel == null)
+        {
+            var vbox = GetNodeOrNull<VBoxContainer>("UI/SelectionPanel/VBox");
+            if (vbox != null)
+            {
+                _logisticsLabel = new Label { Name = "LogisticsLabel" };
+                vbox.AddChild(_logisticsLabel);
+            }
+        }
         if (_btnModeColonists != null)
             _btnModeColonists.Pressed += () => SetSelectionTargetKind(WorldSelectionTargetKind.Colonists);
         if (_btnModeTrees != null)
@@ -215,22 +274,32 @@ public partial class Game : Node3D
 
 
         simFacade = new SimulationFacade(sim, lockstep);
+        _commandPipeline = new GameCommandPipelineModule(sim, lockstep, localPlayerId);
+        _uiModule = new GameUiModule();
+        _viewModule = new GameViewModule();
+        _selectionModule = new GameSelectionModule();
+        _inputModule = new GameInputModule();
         SpawnVisuals();
         spawnedTiles.Clear();
 
         _tileCubeMesh = new BoxMesh();
         _terrainSmartCutShader = GD.Load<Shader>("res://project/Godot/Shaders/TerrainSmartCut.gdshader");
         _tileCubeMesh.SurfaceSetMaterial(0, null);
+        InitBuildPreviewGhost();
+        InitBuildDragPreviewVisual();
+        InitBuildQueuedPreviewVisual();
+        InitVirtualScaffoldPreviewVisual();
 
         cameraController = new CameraController(cameraPivot, camera);
         selectionManager = new SelectionManager(camera, colonVisuals, localPlayerId);
         selectionManager.TargetKind = _selectionTargetKind;
-        unitController = new UnitController(sim, lockstep, camera, GetNode<Node>("UI"),
+        unitController = new UnitController(sim, lockstep, camera, GetNode<Node>("UI"), localPlayerId,
             (out Vector3I anchor) => TryGetMoveOrderAnchorFromScreen(out anchor));
         UpdateSelectionTargetUi();
 
         sim.OnJobStarted   += OnJobStarted;
         sim.OnJobCompleted   += OnJobCompleted;
+        lockstep.OnSnapshotDivergence += OnLockstepDivergence;
     }
 
     public override void _Process(double delta)
@@ -240,6 +309,13 @@ public partial class Game : Node3D
 
         ComputeTerrainOcclusionHiddenSet();
         UpdateTerrainHoverCell();
+        UpdateVoxelDragPreview();
+        UpdateBuildPreviewGhost();
+        UpdateBuildDragPreviewVisual();
+        UpdateBuildQueuedPreviewVisual();
+        UpdateVirtualScaffoldPreviewVisual();
+        if (_selectionTargetKind == WorldSelectionTargetKind.BuildBlocks)
+            RefreshBuildStatusLabel();
 
         lastFrameDeltaSeconds = (float)delta;
         accumulator += delta;
@@ -312,10 +388,20 @@ public partial class Game : Node3D
 
     public override void _UnhandledInput(InputEvent @event)
     {
+        if (_inputModule == null || _selectionModule == null)
+            return;
+
         // Raccourcis globaux : avec le focus sur les boutons UI, _Input du Game ne reçoit souvent pas les touches.
         if (@event is InputEventKey key && key.Pressed && !key.Echo)
         {
-            if (key.PhysicalKeycode == Key.V || key.Keycode == Key.V)
+            if ((key.PhysicalKeycode == Key.Escape || key.Keycode == Key.Escape) && _terrainMineDragTracking)
+            {
+                CancelVoxelDrag(ignoreNextLeftRelease: true);
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+
+            if (_inputModule.IsShortcut(key, Key.V))
             {
                 _verticalSliceTerrainActive = !_verticalSliceTerrainActive;
                 _multimeshPeelStateToken = ulong.MaxValue;
@@ -326,18 +412,62 @@ public partial class Game : Node3D
                 return;
             }
 
-            if (key.PhysicalKeycode == Key.T || key.Keycode == Key.T)
+            if (_inputModule.IsShortcut(key, Key.T))
             {
                 if (cameraController != null && selectionManager != null && unitController != null)
                 {
-                    var next = _selectionTargetKind switch
-                    {
-                        WorldSelectionTargetKind.Colonists => WorldSelectionTargetKind.Trees,
-                        WorldSelectionTargetKind.Trees => WorldSelectionTargetKind.TerrainTiles,
-                        _ => WorldSelectionTargetKind.Colonists
-                    };
+                    var next = _selectionModule.Next(_selectionTargetKind);
                     SetSelectionTargetKind(next);
                 }
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+
+            if (_inputModule.IsShortcut(key, Key.B))
+            {
+                SetSelectionTargetKind(WorldSelectionTargetKind.BuildBlocks);
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+
+            if (_selectionTargetKind == WorldSelectionTargetKind.BuildBlocks
+                && _inputModule.IsShortcut(key, BuildLayerUpKey))
+            {
+                _buildSelectionLayerY++;
+                _buildSelectionLayerInitialized = true;
+                GD.Print($"[Build] Couche Y = {_buildSelectionLayerY}");
+                UpdateSelectionTargetUi();
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+
+            if (_selectionTargetKind == WorldSelectionTargetKind.BuildBlocks
+                && _inputModule.IsShortcut(key, BuildLayerDownKey))
+            {
+                _buildSelectionLayerY--;
+                _buildSelectionLayerInitialized = true;
+                GD.Print($"[Build] Couche Y = {_buildSelectionLayerY}");
+                UpdateSelectionTargetUi();
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+
+            if (_selectionTargetKind == WorldSelectionTargetKind.BuildBlocks
+                && _inputModule.IsShortcut(key, BuildDepthUpKey))
+            {
+                _buildExtrudeDepth = Mathf.Clamp(_buildExtrudeDepth + 1, 1, 128);
+                GD.Print($"[Build] Profondeur = {_buildExtrudeDepth}");
+                UpdateSelectionTargetUi();
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+
+            if (_selectionTargetKind == WorldSelectionTargetKind.BuildBlocks
+                && _inputModule.IsShortcut(key, BuildDepthDownKey))
+            {
+                _buildExtrudeDepth = Mathf.Clamp(_buildExtrudeDepth - 1, 1, 128);
+                GD.Print($"[Build] Profondeur = {_buildExtrudeDepth}");
+                UpdateSelectionTargetUi();
                 GetViewport().SetInputAsHandled();
                 return;
             }
@@ -346,17 +476,43 @@ public partial class Game : Node3D
         if (sim?.World == null || camera == null)
             return;
 
-        if (@event is InputEventMouseButton mb && mb.ButtonIndex == MouseButton.Left && !mb.Pressed)
+        if (@event is InputEventMouseButton mb && mb.ButtonIndex == MouseButton.Left)
         {
-            if (_selectionTargetKind == WorldSelectionTargetKind.Trees)
+            if (!mb.Pressed && _ignoreNextLeftReleaseAfterCancel)
             {
-                TryPickTreeAtScreen();
-                GetViewport().SetInputAsHandled();
+                _ignoreNextLeftReleaseAfterCancel = false;
+                return;
             }
-            else if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles)
+
+            if (mb.Pressed
+                && _selectionModule.IsVoxelSelectionMode(_selectionTargetKind))
             {
-                TryPickTerrainTileAtScreen();
-                GetViewport().SetInputAsHandled();
+                _terrainMineDragTracking = true;
+                _terrainMineDragStartScreen = mb.Position;
+                Vector2 vpPress = mb.Position;
+                if (TerrainPickUsePixelCenterRay)
+                    vpPress += new Vector2(0.5f, 0.5f);
+                _terrainMineDragStartCell = TryGetDragModeCellViewport(vpPress, out Vector3I startCell)
+                    ? startCell
+                    : null;
+            }
+            else if (!mb.Pressed)
+            {
+                if (_selectionTargetKind == WorldSelectionTargetKind.Trees)
+                {
+                    TryPickTreeAtScreen();
+                    GetViewport().SetInputAsHandled();
+                }
+                else if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles)
+                {
+                    FinishVoxelDragOrClick(mb);
+                    GetViewport().SetInputAsHandled();
+                }
+                else if (_selectionTargetKind == WorldSelectionTargetKind.BuildBlocks)
+                {
+                    FinishVoxelDragOrClick(mb);
+                    GetViewport().SetInputAsHandled();
+                }
             }
         }
     }
@@ -366,6 +522,29 @@ public partial class Game : Node3D
         // Godot can dispatch input before _Ready has fully wired controllers.
         if (cameraController == null || selectionManager == null || unitController == null)
             return;
+
+        if (@event is InputEventMouseButton wheelEvt
+            && wheelEvt.Pressed
+            && _selectionTargetKind == WorldSelectionTargetKind.BuildBlocks
+            && wheelEvt.ShiftPressed)
+        {
+            if (wheelEvt.ButtonIndex == MouseButton.WheelUp)
+            {
+                _buildSelectionLayerY++;
+                _buildSelectionLayerInitialized = true;
+                UpdateSelectionTargetUi();
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+            if (wheelEvt.ButtonIndex == MouseButton.WheelDown)
+            {
+                _buildSelectionLayerY--;
+                _buildSelectionLayerInitialized = true;
+                UpdateSelectionTargetUi();
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+        }
 
         cameraController.HandleInput(@event);
         selectionManager.HandleInput(@event);
@@ -415,6 +594,31 @@ public partial class Game : Node3D
             {
                 GD.Print($"CHUNK METRICS active={_chunkVisuals.Count} needed={lastNeededChunkCount} last_us={lastChunkRefreshMicroseconds}");
             }
+
+            if (key.Keycode == Key.F7)
+            {
+                string saveJson = sim.ExportSaveJson();
+                using var file = FileAccess.Open("user://savegame.json", FileAccess.ModeFlags.Write);
+                file.StoreString(saveJson);
+                GD.Print("[Save] État simulation sauvegardé dans user://savegame.json");
+            }
+
+            if (key.Keycode == Key.F8)
+            {
+                if (!FileAccess.FileExists("user://savegame.json"))
+                {
+                    GD.PrintErr("[Save] Aucun fichier user://savegame.json à charger.");
+                }
+                else
+                {
+                    using var file = FileAccess.Open("user://savegame.json", FileAccess.ModeFlags.Read);
+                    sim.ImportSaveJson(file.GetAsText());
+                    RebuildColonVisuals();
+                    _terrainMeshLayoutVersion++;
+                    _multimeshPeelStateToken = ulong.MaxValue;
+                    GD.Print("[Save] État simulation rechargé.");
+                }
+            }
         }
     }
 
@@ -423,49 +627,20 @@ public partial class Game : Node3D
         simFacade.Step();
     }
 
+    void OnLockstepDivergence(SimulationSnapshot local, SimulationSnapshot remote)
+    {
+        GD.PrintErr($"[Lockstep] Divergence détectée tick={local.Tick} local={local.StateHash} remote={remote.StateHash}");
+    }
+
     void Render()
     {
-        foreach (var pair in colonVisuals)
-        {
-            var colon = pair.Key;
-            var node = pair.Value;
-
-            var currentPos = new Vector3(colon.Position.X, colon.Position.Y, colon.Position.Z);
-            var renderPos = currentPos;
-
-            if (colon.Path != null && colon.Path.Count > 0)
-            {
-                var next = colon.Path[0];
-                var nextPos = new Vector3(next.X, next.Y, next.Z);
-                renderPos = currentPos.Lerp(nextPos, Mathf.Clamp(colon.MoveProgress, 0f, 1f));
-            }
-
-            var mesh = node.GetNode<MeshInstance3D>("MeshInstance3D");
-
-            // 🎯 sélection
-            mesh.MaterialOverride =
-                selectionManager.SelectedColonists.Contains(colon)
-                ? selectedMat
-                : defaultMat;
-
-            var tilePos = colon.Position;
-
-            // 👁️ visibilité
-            if (colon.OwnerId != 0) // ennemi
-            {
-                if (!sim.Vision.IsVisible(tilePos))
-                {
-                    node.Visible = false;
-                    continue;
-                }
-            }
-
-            node.Visible = true;
-
-            // Smooth visual update to avoid jitter when many move commands arrive quickly.
-            float maxStep = colon.MoveSpeed * lastFrameDeltaSeconds;
-            node.Position = node.Position.MoveToward(renderPos, maxStep);
-        }
+        _viewModule.RenderColonists(
+            colonVisuals,
+            selectionManager,
+            selectedMat,
+            defaultMat,
+            sim,
+            lastFrameDeltaSeconds);
     }
 
     void SpawnVisuals()
@@ -479,6 +654,17 @@ public partial class Game : Node3D
 
             colonVisuals[colon] = instance;
         }
+    }
+
+    void RebuildColonVisuals()
+    {
+        foreach (var pair in colonVisuals)
+        {
+            if (GodotObject.IsInstanceValid(pair.Value))
+                pair.Value.QueueFree();
+        }
+        colonVisuals.Clear();
+        SpawnVisuals();
     }
 
     void InitSimulation()
@@ -914,7 +1100,8 @@ public partial class Game : Node3D
                 chunkPos.Z * Map.CHUNK_SIZE + z
             );
 
-            if (tile.Type == "ground" || tile.Type == "platform" || tile.Type == "stairs" || tile.Type == "stone" || tile.Type == "dirt")
+            if (tile.Type == "ground" || tile.Type == "platform" || tile.Type == "stairs" || tile.Type == "stone" || tile.Type == "dirt" || tile.Type == "scaffold"
+                || tile.Type == BuildPlacementTileType)
             {
                 var wi = new Vector3I((int)worldPos.X, (int)worldPos.Y, (int)worldPos.Z);
                 cv.SolidInstanceByWorld[wi] = solidTransforms.Count;
@@ -1271,10 +1458,25 @@ public partial class Game : Node3D
         _selectionTargetKind = kind;
         if (selectionManager != null)
             selectionManager.TargetKind = kind;
+        if (kind == WorldSelectionTargetKind.BuildBlocks && !_buildSelectionLayerInitialized)
+        {
+            _buildSelectionLayerY = Mathf.RoundToInt(camera?.GlobalPosition.Y ?? Map.ColonistWalkY);
+            _buildSelectionLayerInitialized = true;
+        }
         if (kind != WorldSelectionTargetKind.Trees)
             _selectedTreeTile = null;
         if (kind != WorldSelectionTargetKind.TerrainTiles)
+        {
             _selectedTerrainTiles.Clear();
+            _terrainMineDragTracking = false;
+            _terrainMineDragStartCell = null;
+            _terrainMineDragPreview.Clear();
+        }
+        if (kind != WorldSelectionTargetKind.BuildBlocks)
+        {
+            _buildPreviewCell = null;
+        }
+
         UpdateSelectionTargetUi();
     }
 
@@ -1289,7 +1491,8 @@ public partial class Game : Node3D
             {
                 WorldSelectionTargetKind.Colonists => "Cible : Colons (clic / cadre) — survol voxel comme blocs",
                 WorldSelectionTargetKind.Trees => "Cible : Arbres — même visée que blocs (coupe V, Q/Alt fond) · survol surligné",
-                WorldSelectionTargetKind.TerrainTiles => "Cible : Blocs — clic = 1 · Shift+clic = + · Q/Alt+clic = fond · V = coupe terrain",
+                WorldSelectionTargetKind.TerrainTiles => "Cible : Blocs — clic = 1 · glisser = ligne mineable · Shift = ajouter · B = mode build · Q/Alt = fond · V = coupe",
+                WorldSelectionTargetKind.BuildBlocks => "Cible : Build — détails et couche dans le bandeau bleu ci‑dessous",
                 _ => "Cible : —"
             };
         }
@@ -1323,6 +1526,31 @@ public partial class Game : Node3D
             _btnCutTree.Disabled = !_selectedTreeTile.HasValue;
 
         RefreshMineStoneButtonState();
+        RefreshBuildStatusLabel();
+    }
+
+    void RefreshBuildStatusLabel()
+    {
+        if (_buildStatusLabel == null)
+            return;
+        if (_selectionTargetKind != WorldSelectionTargetKind.BuildBlocks)
+        {
+            _buildStatusLabel.Visible = false;
+            return;
+        }
+
+        _buildStatusLabel.Visible = true;
+        var sb = new System.Text.StringBuilder();
+        sb.Append("Couche Y = ").Append(_buildSelectionLayerY);
+        sb.Append("  ·  Profondeur = ").Append(_buildExtrudeDepth);
+        sb.AppendLine();
+        sb.Append("Shift+molette ou PgUp/PgDn : couche  ·  R/F : profondeur  ·  Echap : annuler drag");
+        if (_terrainMineDragTracking)
+        {
+            sb.AppendLine();
+            sb.Append("Sélection… preview ").Append(_terrainMineDragPreview.Count).Append(" case(s)");
+        }
+        _buildStatusLabel.Text = sb.ToString();
     }
 
     void RefreshMineStoneButtonState()
@@ -1748,6 +1976,9 @@ public partial class Game : Node3D
         int h = _selectedTerrainTiles.Count;
         foreach (var v in _selectedTerrainTiles)
             h = unchecked(h * -1521134295 + v.GetHashCode());
+        h = unchecked(h * 31 + _terrainMineDragPreview.Count);
+        foreach (var v in _terrainMineDragPreview)
+            h = unchecked(h * -1521134295 + v.GetHashCode());
         return h;
     }
 
@@ -1947,6 +2178,12 @@ public partial class Game : Node3D
                         c = c.Lerp(TerrainHoverHighlightMix, hoverMixAmt);
                 }
 
+                if (hl && _terrainMineDragPreview.Count > 0 && _terrainMineDragPreview.Contains(w))
+                {
+                    float prevAmt = Mathf.Clamp(TerrainDragLinePreviewAmount, 0f, 1f);
+                    c = c.Lerp(TerrainDragLinePreviewMix, prevAmt);
+                }
+
                 if (hl && _selectedTerrainTiles.Contains(w))
                     c = c.Lerp(TerrainSelectionHighlightMix, mix);
 
@@ -1955,10 +2192,255 @@ public partial class Game : Node3D
         }
     }
 
-    void TryPickTerrainTileAtScreen()
+    Vector2 GetTerrainPickViewportMouse()
+    {
+        Vector2 vpMouse = camera.GetViewport().GetMousePosition();
+        if (TerrainPickUsePixelCenterRay)
+            vpMouse += new Vector2(0.5f, 0.5f);
+        return vpMouse;
+    }
+
+    void CancelVoxelDrag(bool ignoreNextLeftRelease = false)
+    {
+        _terrainMineDragTracking = false;
+        _terrainMineDragStartCell = null;
+        _terrainMineDragPreview.Clear();
+        if (ignoreNextLeftRelease)
+            _ignoreNextLeftReleaseAfterCancel = true;
+    }
+
+    bool TryGetBuildLayerCellViewport(Vector2 vpMouse, out Vector3I cell)
+    {
+        cell = default;
+        if (camera == null)
+            return false;
+
+        Vector3 rayOrigin = camera.ProjectRayOrigin(vpMouse);
+        Vector3 rayDir = camera.ProjectRayNormal(vpMouse);
+        if (Mathf.Abs(rayDir.Y) < 1e-6f)
+            return false;
+
+        float t = (_buildSelectionLayerY - rayOrigin.Y) / rayDir.Y;
+        if (t < 0f)
+            return false;
+
+        Vector3 p = rayOrigin + rayDir * t;
+        cell = new Vector3I(
+            Mathf.FloorToInt(p.X + 0.5f),
+            _buildSelectionLayerY,
+            Mathf.FloorToInt(p.Z + 0.5f));
+        return true;
+    }
+
+    bool TryGetDragModeCellViewport(Vector2 vpMouse, out Vector3I cell)
+    {
+        cell = default;
+        if (_selectionTargetKind == WorldSelectionTargetKind.BuildBlocks)
+        {
+            return TryGetBuildLayerCellViewport(vpMouse, out cell);
+        }
+        return TryGetTerrainPickedCellViewport(vpMouse, out cell, respectPeelModifierKeys: true);
+    }
+
+    void FillDragPlaneArea(Vector3I a, Vector3I b, List<Vector3I> output)
+    {
+        output.Clear();
+
+        int dx = Mathf.Abs(b.X - a.X);
+        int dy = Mathf.Abs(b.Y - a.Y);
+        int dz = Mathf.Abs(b.Z - a.Z);
+        int maxCells = Mathf.Max(1, VoxelDragMaxCells);
+
+        if (dy <= dx && dy <= dz) // plan horizontal XZ
+        {
+            int y = a.Y;
+            int minX = Mathf.Min(a.X, b.X);
+            int maxX = Mathf.Max(a.X, b.X);
+            int minZ = Mathf.Min(a.Z, b.Z);
+            int maxZ = Mathf.Max(a.Z, b.Z);
+            for (int x = minX; x <= maxX; x++)
+            for (int z = minZ; z <= maxZ; z++)
+            {
+                output.Add(new Vector3I(x, y, z));
+                if (output.Count >= maxCells)
+                    return;
+            }
+            return;
+        }
+
+        if (dz <= dx && dz <= dy) // plan vertical XY
+        {
+            int z = a.Z;
+            int minX = Mathf.Min(a.X, b.X);
+            int maxX = Mathf.Max(a.X, b.X);
+            int minY = Mathf.Min(a.Y, b.Y);
+            int maxY = Mathf.Max(a.Y, b.Y);
+            for (int x = minX; x <= maxX; x++)
+            for (int y = minY; y <= maxY; y++)
+            {
+                output.Add(new Vector3I(x, y, z));
+                if (output.Count >= maxCells)
+                    return;
+            }
+            return;
+        }
+
+        // plan vertical YZ
+        int xx = a.X;
+        int minYY = Mathf.Min(a.Y, b.Y);
+        int maxYY = Mathf.Max(a.Y, b.Y);
+        int minZZ = Mathf.Min(a.Z, b.Z);
+        int maxZZ = Mathf.Max(a.Z, b.Z);
+        for (int y = minYY; y <= maxYY; y++)
+        for (int z = minZZ; z <= maxZZ; z++)
+        {
+            output.Add(new Vector3I(xx, y, z));
+            if (output.Count >= maxCells)
+                return;
+        }
+    }
+
+    void FillBuildExtrudeArea(Vector3I a, Vector3I b, List<Vector3I> output)
+    {
+        output.Clear();
+        int minX = Mathf.Min(a.X, b.X);
+        int maxX = Mathf.Max(a.X, b.X);
+        int minZ = Mathf.Min(a.Z, b.Z);
+        int maxZ = Mathf.Max(a.Z, b.Z);
+        int baseY = _buildSelectionLayerY;
+        int depth = Mathf.Clamp(_buildExtrudeDepth, 1, 128);
+        int maxCells = Mathf.Max(1, VoxelDragMaxCells);
+
+        for (int y = baseY; y < baseY + depth; y++)
+        for (int x = minX; x <= maxX; x++)
+        for (int z = minZ; z <= maxZ; z++)
+        {
+            output.Add(new Vector3I(x, y, z));
+            if (output.Count >= maxCells)
+                return;
+        }
+    }
+
+    void BuildOrderedMineSelection(System.Collections.Generic.IEnumerable<Vector3I> source, List<Vector3I> output)
+    {
+        output.Clear();
+        var map = sim?.World?.CurrentMap;
+        if (map == null)
+            return;
+
+        foreach (var c in source)
+        {
+            if (TerrainMineRules.IsMineableBlock(map.GetTile(c)))
+                output.Add(c);
+        }
+
+        VoxelSelectionOrder.SortForMineEnqueue(output);
+    }
+
+    void UpdateVoxelDragPreview()
+    {
+        if ((_selectionTargetKind != WorldSelectionTargetKind.TerrainTiles
+                && _selectionTargetKind != WorldSelectionTargetKind.BuildBlocks)
+            || !_terrainMineDragTracking
+            || !Input.IsMouseButtonPressed(MouseButton.Left)
+            || sim?.World?.CurrentMap == null
+            || camera == null
+            || !_terrainMineDragStartCell.HasValue)
+        {
+            if (_terrainMineDragPreview.Count > 0)
+                _terrainMineDragPreview.Clear();
+            return;
+        }
+
+        Vector2 vp = GetTerrainPickViewportMouse();
+        if (!TryGetDragModeCellViewport(vp, out Vector3I endCell))
+        {
+            if (_terrainMineDragPreview.Count > 0)
+                _terrainMineDragPreview.Clear();
+            return;
+        }
+
+        if (_selectionTargetKind == WorldSelectionTargetKind.BuildBlocks)
+            FillBuildExtrudeArea(_terrainMineDragStartCell.Value, endCell, _terrainLineBuffer);
+        else
+            FillDragPlaneArea(_terrainMineDragStartCell.Value, endCell, _terrainLineBuffer);
+        _terrainMineDragPreview.Clear();
+        var map = sim.World.CurrentMap;
+        if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles)
+        {
+            BuildOrderedMineSelection(_terrainLineBuffer, _orderedVoxelSelectionBuffer);
+            foreach (var c in _orderedVoxelSelectionBuffer)
+            {
+                _terrainMineDragPreview.Add(c);
+            }
+            return;
+        }
+
+        foreach (var c in _terrainLineBuffer)
+        {
+            var t = map.GetTile(c);
+            bool alreadyPlanned = sim.jobBoard.HasActiveJobOnTarget(c, JobType.BuildBlock);
+            if ((t == null || !t.Solid) || alreadyPlanned)
+                _terrainMineDragPreview.Add(c);
+        }
+    }
+
+    void FinishVoxelDragOrClick(InputEventMouseButton mb)
+    {
+        _terrainMineDragPreview.Clear();
+
+        if (!_terrainMineDragTracking)
+            return;
+
+        bool shift = Input.IsPhysicalKeyPressed(Key.Shift);
+        Vector2 endScreen = mb.Position;
+        float dist = (endScreen - _terrainMineDragStartScreen).Length();
+        Vector2 vpEnd = endScreen;
+        if (TerrainPickUsePixelCenterRay)
+            vpEnd += new Vector2(0.5f, 0.5f);
+
+        bool smallDrag = dist <= TerrainMineDragMaxClickPixels;
+
+        if (smallDrag && _selectionTargetKind == WorldSelectionTargetKind.TerrainTiles)
+            TryPickTerrainTilesAtViewport(GetTerrainPickViewportMouse());
+        else if (smallDrag && _selectionTargetKind == WorldSelectionTargetKind.BuildBlocks)
+        {
+            if (_buildPreviewCell.HasValue)
+                TryQueueBuildBlockAtCell(_buildPreviewCell.Value);
+        }
+        else if (_terrainMineDragStartCell.HasValue && TryGetDragModeCellViewport(vpEnd, out Vector3I endCell))
+        {
+            if (_selectionTargetKind == WorldSelectionTargetKind.BuildBlocks)
+                FillBuildExtrudeArea(_terrainMineDragStartCell.Value, endCell, _terrainLineBuffer);
+            else
+                FillDragPlaneArea(_terrainMineDragStartCell.Value, endCell, _terrainLineBuffer);
+            var map = sim.World.CurrentMap;
+            if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles)
+            {
+                if (!shift)
+                    _selectedTerrainTiles.Clear();
+                BuildOrderedMineSelection(_terrainLineBuffer, _orderedVoxelSelectionBuffer);
+                foreach (var c in _orderedVoxelSelectionBuffer)
+                {
+                    _selectedTerrainTiles.Add(c);
+                }
+                UpdateSelectionTargetUi();
+            }
+            else if (_selectionTargetKind == WorldSelectionTargetKind.BuildBlocks)
+                TryQueueBuildSiteFromCells(_terrainLineBuffer);
+        }
+        else if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles)
+            TryPickTerrainTilesAtViewport(vpEnd);
+        else if (_selectionTargetKind == WorldSelectionTargetKind.BuildBlocks && _buildPreviewCell.HasValue)
+            TryQueueBuildBlockAtCell(_buildPreviewCell.Value);
+
+        CancelVoxelDrag();
+    }
+
+    void TryPickTerrainTilesAtViewport(Vector2 viewportMouse)
     {
         bool shift = Input.IsPhysicalKeyPressed(Key.Shift);
-        if (!TryGetTerrainPickedCellFromScreen(out Vector3I pick, respectPeelModifierKeys: true))
+        if (!TryGetTerrainPickedCellViewport(viewportMouse, out Vector3I pick, respectPeelModifierKeys: true))
         {
             if (!shift)
                 _selectedTerrainTiles.Clear();
@@ -1980,6 +2462,398 @@ public partial class Game : Node3D
         }
 
         UpdateSelectionTargetUi();
+    }
+
+    void TryPickTerrainTileAtScreen() => TryPickTerrainTilesAtViewport(GetTerrainPickViewportMouse());
+
+    bool TryGetBuildPlacementCellFromScreen(out Vector3I placeCell)
+    {
+        placeCell = default;
+        return TryGetBuildPlacementCellViewport(GetTerrainPickViewportMouse(), out placeCell);
+    }
+
+    bool TryGetBuildPlacementCellViewport(Vector2 vpMouse, out Vector3I placeCell)
+    {
+        placeCell = default;
+        if (!TryGetBuildLayerCellViewport(vpMouse, out Vector3I pick))
+            return false;
+        var map = sim.World.CurrentMap;
+        var existing = map.GetTile(pick);
+        if (existing == null)
+            return false;
+
+        bool planned = sim.jobBoard != null && sim.jobBoard.HasActiveJobOnTarget(pick, JobType.BuildBlock);
+        if (existing.Solid)
+        {
+            // En mode build, si la cellule visée est déjà un mur solide,
+            // on propose un placement latéral plutôt que "dans" le bloc.
+            if (!TryFindBuildSidePlacementCell(pick, out placeCell))
+                return false;
+            return true;
+        }
+
+        placeCell = pick;
+        return true;
+    }
+
+    bool TryFindBuildSidePlacementCell(Vector3I solidCell, out Vector3I sideCell)
+    {
+        sideCell = default;
+        var map = sim?.World?.CurrentMap;
+        if (map == null || camera == null)
+            return false;
+
+        ReadOnlySpan<Vector3I> offsets = stackalloc Vector3I[]
+        {
+            new(1, 0, 0), new(-1, 0, 0), new(0, 0, 1), new(0, 0, -1),
+            new(1, 0, 1), new(1, 0, -1), new(-1, 0, 1), new(-1, 0, -1),
+        };
+
+        Vector3 center = new Vector3(solidCell.X + 0.5f, solidCell.Y + 0.5f, solidCell.Z + 0.5f);
+        Vector3 towardCam = (camera.GlobalPosition - center).Normalized();
+        bool found = false;
+        float bestScore = float.NegativeInfinity;
+        Vector3I best = default;
+
+        foreach (var d in offsets)
+        {
+            var c = solidCell + d;
+            var t = map.GetTile(c);
+            if (t == null)
+                continue;
+
+            bool planned = sim.jobBoard != null && sim.jobBoard.HasActiveJobOnTarget(c, JobType.BuildBlock);
+            if (t.Solid && !planned)
+                continue;
+
+            Vector3 dir = new Vector3(d.X, d.Y, d.Z).Normalized();
+            float score = dir.Dot(towardCam);
+            if (score <= bestScore)
+                continue;
+
+            bestScore = score;
+            best = c;
+            found = true;
+        }
+
+        if (!found)
+            return false;
+
+        sideCell = best;
+        return true;
+    }
+
+    void TryQueueBuildBlockAtHoveredFace()
+    {
+        if (sim?.World?.CurrentMap == null)
+            return;
+        if (!TryGetBuildPlacementCellFromScreen(out Vector3I placeCell))
+            return;
+        TryQueueBuildBlockAtCell(placeCell);
+    }
+
+    void TryQueueBuildBlockAtCell(Vector3I placeCell)
+    {
+        var existingTile = sim.World.CurrentMap.GetTile(placeCell);
+        if (existingTile != null && existingTile.Solid
+            && !sim.jobBoard.HasActiveJobOnTarget(placeCell, JobType.BuildBlock))
+            return;
+
+        if (sim.jobBoard.HasActiveJobOnTarget(placeCell, JobType.BuildBlock))
+            return;
+
+        _commandPipeline.QueueBuild(new[] { placeCell }, BuildPlacementTileType, JobPriority.Normal);
+        GD.Print($"[Jobs] Construction ajoutée @ {placeCell} (file : {sim.jobBoard.ActiveJobCount})");
+    }
+
+    void TryQueueBuildSiteFromCells(List<Vector3I> cells)
+    {
+        if (sim?.World?.CurrentMap == null || cells == null || cells.Count == 0)
+            return;
+
+        var map = sim.World.CurrentMap;
+        var valid = new List<Vector3I>();
+        foreach (var c in cells)
+        {
+            var t = map.GetTile(c);
+            bool planned = sim.jobBoard.HasActiveJobOnTarget(c, JobType.BuildBlock);
+            if (t != null && t.Solid && !planned)
+                continue;
+            if (planned)
+                continue;
+            valid.Add(c);
+        }
+
+        if (valid.Count >= 2)
+        {
+            _commandPipeline.QueueBuild(valid, BuildPlacementTileType, JobPriority.Normal);
+            return;
+        }
+
+        if (valid.Count == 1)
+            TryQueueBuildBlockAtCell(valid[0]);
+    }
+
+    void InitBuildPreviewGhost()
+    {
+        _buildPreviewGhost = new MeshInstance3D();
+        _buildPreviewGhost.Mesh = _tileCubeMesh;
+        _buildPreviewMaterial = new StandardMaterial3D();
+        _buildPreviewMaterial.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
+        _buildPreviewMaterial.ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded;
+        _buildPreviewMaterial.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+        ApplyBuildPreviewGhostAppearance();
+        _buildPreviewGhost.MaterialOverride = _buildPreviewMaterial;
+        _buildPreviewGhost.Visible = false;
+        AddChild(_buildPreviewGhost);
+    }
+
+    void InitBuildDragPreviewVisual()
+    {
+        _buildDragPreview = new MultiMeshInstance3D();
+        var mm = new MultiMesh
+        {
+            TransformFormat = MultiMesh.TransformFormatEnum.Transform3D,
+            UseColors = false,
+            InstanceCount = 0,
+            Mesh = _tileCubeMesh
+        };
+        _buildDragPreview.Multimesh = mm;
+        _buildDragPreviewMaterial = new StandardMaterial3D();
+        _buildDragPreviewMaterial.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
+        _buildDragPreviewMaterial.ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded;
+        _buildDragPreviewMaterial.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+        _buildDragPreviewMaterial.NoDepthTest = true;
+        _buildDragPreviewMaterial.EmissionEnabled = true;
+        _buildDragPreviewMaterial.Emission = new Color(0.25f, 0.25f, 0.25f);
+        _buildDragPreviewMaterial.EmissionEnergyMultiplier = 0.6f;
+        _buildDragPreview.MaterialOverride = _buildDragPreviewMaterial;
+        _buildDragPreview.Visible = false;
+        AddChild(_buildDragPreview);
+    }
+
+    void InitBuildQueuedPreviewVisual()
+    {
+        _buildQueuedPreview = new MultiMeshInstance3D();
+        var mm = new MultiMesh
+        {
+            TransformFormat = MultiMesh.TransformFormatEnum.Transform3D,
+            UseColors = false,
+            InstanceCount = 0,
+            Mesh = _tileCubeMesh
+        };
+        _buildQueuedPreview.Multimesh = mm;
+        _buildQueuedPreviewMaterial = new StandardMaterial3D();
+        _buildQueuedPreviewMaterial.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
+        _buildQueuedPreviewMaterial.ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded;
+        _buildQueuedPreviewMaterial.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+        _buildQueuedPreviewMaterial.NoDepthTest = true;
+        _buildQueuedPreview.MaterialOverride = _buildQueuedPreviewMaterial;
+        _buildQueuedPreview.Visible = false;
+        AddChild(_buildQueuedPreview);
+    }
+
+    void InitVirtualScaffoldPreviewVisual()
+    {
+        _virtualScaffoldPreview = new MultiMeshInstance3D();
+        var mm = new MultiMesh
+        {
+            TransformFormat = MultiMesh.TransformFormatEnum.Transform3D,
+            UseColors = false,
+            InstanceCount = 0,
+            Mesh = _tileCubeMesh
+        };
+        _virtualScaffoldPreview.Multimesh = mm;
+        _virtualScaffoldPreviewMaterial = new StandardMaterial3D();
+        _virtualScaffoldPreviewMaterial.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
+        _virtualScaffoldPreviewMaterial.ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded;
+        _virtualScaffoldPreviewMaterial.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+        _virtualScaffoldPreviewMaterial.NoDepthTest = true;
+        _virtualScaffoldPreviewMaterial.EmissionEnabled = true;
+        _virtualScaffoldPreviewMaterial.Emission = new Color(0.85f, 0.65f, 0.25f);
+        _virtualScaffoldPreviewMaterial.EmissionEnergyMultiplier = 0.45f;
+        _virtualScaffoldPreview.MaterialOverride = _virtualScaffoldPreviewMaterial;
+        _virtualScaffoldPreview.Visible = false;
+        AddChild(_virtualScaffoldPreview);
+    }
+
+    void ApplyBuildPreviewGhostAppearance()
+    {
+        if (_buildPreviewMaterial == null)
+            return;
+        Color baseRgb = GetTileColor(BuildPlacementTileType);
+        float a = Mathf.Clamp(BuildPreviewGhostAlpha, 0.05f, 1f);
+        _buildPreviewMaterial.AlbedoColor = new Color(baseRgb.R, baseRgb.G, baseRgb.B, a);
+    }
+
+    void UpdateBuildPreviewGhost()
+    {
+        if (_buildPreviewGhost == null)
+            return;
+
+        if (_selectionTargetKind != WorldSelectionTargetKind.BuildBlocks || sim?.World?.CurrentMap == null)
+        {
+            _buildPreviewCell = null;
+            _buildPreviewGhost.Visible = false;
+            return;
+        }
+
+        bool hasCell = false;
+        Vector3I placeCell = default;
+        hasCell = TryGetBuildPlacementCellFromScreen(out placeCell);
+
+        if (hasCell)
+        {
+            if (_terrainMineDragTracking)
+            {
+                _buildPreviewGhost.Visible = false;
+                return;
+            }
+            _buildPreviewCell = placeCell;
+            ApplyBuildPreviewGhostAppearance();
+            _buildPreviewGhost.Position = new Vector3(placeCell.X, placeCell.Y, placeCell.Z);
+            _buildPreviewGhost.Visible = true;
+            return;
+        }
+
+        _buildPreviewCell = null;
+        _buildPreviewGhost.Visible = false;
+    }
+
+    void UpdateBuildDragPreviewVisual()
+    {
+        if (_buildDragPreview?.Multimesh == null || _buildDragPreviewMaterial == null)
+            return;
+
+        bool show = _selectionTargetKind == WorldSelectionTargetKind.BuildBlocks
+            && _terrainMineDragTracking
+            && _terrainMineDragPreview.Count > 0;
+        if (!show)
+        {
+            _buildDragPreview.Visible = false;
+            _buildDragPreview.Multimesh.InstanceCount = 0;
+            return;
+        }
+
+        Color baseRgb = GetTileColor(BuildPlacementTileType);
+        float a = Mathf.Clamp(BuildPreviewGhostAlpha * 0.85f, 0.05f, 1f);
+        _buildDragPreviewMaterial.AlbedoColor = new Color(baseRgb.R, baseRgb.G, baseRgb.B, a);
+
+        var mm = _buildDragPreview.Multimesh;
+        mm.InstanceCount = _terrainMineDragPreview.Count;
+        int i = 0;
+        foreach (var c in _terrainMineDragPreview)
+        {
+            mm.SetInstanceTransform(i, new Transform3D(Basis.Identity, new Vector3(c.X, c.Y, c.Z)));
+            i++;
+        }
+        _buildDragPreview.Visible = true;
+    }
+
+    void UpdateBuildQueuedPreviewVisual()
+    {
+        if (_buildQueuedPreview?.Multimesh == null
+            || _buildQueuedPreviewMaterial == null
+            || sim?.jobBoard == null
+            || sim?.World?.CurrentMap == null)
+            return;
+
+        if (_selectionTargetKind != WorldSelectionTargetKind.BuildBlocks)
+        {
+            _buildQueuedPreview.Visible = false;
+            _buildQueuedPreview.Multimesh.InstanceCount = 0;
+            return;
+        }
+
+        if (_lastBuildQueuedPreviewRefreshTick == sim.Tick)
+            return;
+        _lastBuildQueuedPreviewRefreshTick = sim.Tick;
+
+        sim.jobBoard.CopyActiveTargets(JobType.BuildBlock, _queuedBuildTargetsBuffer);
+        if (_queuedBuildTargetsBuffer.Count == 0)
+        {
+            _buildQueuedPreview.Visible = false;
+            _buildQueuedPreview.Multimesh.InstanceCount = 0;
+            return;
+        }
+
+        var map = sim.World.CurrentMap;
+        int count = 0;
+        foreach (var c in _queuedBuildTargetsBuffer)
+        {
+            var t = map.GetTile(c);
+            if (t == null || !t.Solid)
+                count++;
+        }
+
+        if (count == 0)
+        {
+            _buildQueuedPreview.Visible = false;
+            _buildQueuedPreview.Multimesh.InstanceCount = 0;
+            return;
+        }
+
+        Color baseRgb = GetTileColor(BuildPlacementTileType);
+        float a = Mathf.Clamp(BuildPreviewGhostAlpha * 0.7f, 0.05f, 1f);
+        _buildQueuedPreviewMaterial.AlbedoColor = new Color(baseRgb.R, baseRgb.G, baseRgb.B, a);
+
+        var mm = _buildQueuedPreview.Multimesh;
+        mm.InstanceCount = count;
+        int i = 0;
+        foreach (var c in _queuedBuildTargetsBuffer)
+        {
+            var t = map.GetTile(c);
+            if (t != null && t.Solid)
+                continue;
+            mm.SetInstanceTransform(i++, new Transform3D(Basis.Identity, new Vector3(c.X, c.Y, c.Z)));
+        }
+        _buildQueuedPreview.Visible = true;
+    }
+
+    void UpdateVirtualScaffoldPreviewVisual()
+    {
+        if (_virtualScaffoldPreview?.Multimesh == null
+            || _virtualScaffoldPreviewMaterial == null
+            || sim == null)
+            return;
+
+        bool show = ShowVirtualScaffolds
+            && _selectionTargetKind == WorldSelectionTargetKind.BuildBlocks
+            && sim.VirtualScaffoldCells != null
+            && sim.VirtualScaffoldCells.Count > 0;
+
+        if (!show)
+        {
+            if (_lastVirtualScaffoldPreviewVisible)
+            {
+                _virtualScaffoldPreview.Visible = false;
+                _virtualScaffoldPreview.Multimesh.InstanceCount = 0;
+                _lastVirtualScaffoldPreviewVisible = false;
+            }
+            return;
+        }
+
+        _lastVirtualScaffoldPreviewVisible = true;
+        int version = sim.VirtualScaffoldVersion;
+        if (_lastVirtualScaffoldPreviewVersion == version)
+        {
+            if (!_virtualScaffoldPreview.Visible)
+                _virtualScaffoldPreview.Visible = true;
+            return;
+        }
+        _lastVirtualScaffoldPreviewVersion = version;
+
+        Color baseRgb = GetTileColor("scaffold");
+        float a = Mathf.Clamp(VirtualScaffoldAlpha, 0.05f, 1f);
+        _virtualScaffoldPreviewMaterial.AlbedoColor = new Color(baseRgb.R, baseRgb.G, baseRgb.B, a);
+
+        var mm = _virtualScaffoldPreview.Multimesh;
+        int count = sim.VirtualScaffoldCells.Count;
+        mm.InstanceCount = count;
+        int i = 0;
+        foreach (var c in sim.VirtualScaffoldCells)
+            mm.SetInstanceTransform(i++, new Transform3D(Basis.Identity, new Vector3(c.X, c.Y, c.Z)));
+        _virtualScaffoldPreview.Visible = true;
     }
 
     void TryPickTreeAtScreen()
@@ -2027,12 +2901,7 @@ public partial class Game : Node3D
         if (sim.jobBoard.HasActiveJobOnTarget(tilePos, JobType.CutTree))
             return;
 
-        sim.jobBoard.AddJob(new SimJob
-        {
-            Type = JobType.CutTree,
-            Priority = JobPriority.Normal,
-            Target = tilePos
-        });
+        _commandPipeline.QueueCutTree(tilePos, JobPriority.Normal);
 
         GD.Print($"[Jobs] Coupe d'arbre ajoutée à la file : {tilePos} (total actifs : {sim.jobBoard.ActiveJobCount})");
 
@@ -2045,23 +2914,11 @@ public partial class Game : Node3D
         if (sim?.World == null || _selectedTerrainTiles.Count == 0)
             return;
 
-        int added = 0;
-        foreach (var tilePos in _selectedTerrainTiles)
-        {
-            var t = sim.World.CurrentMap.GetTile(tilePos);
-            if (!TerrainMineRules.IsMineableBlock(t))
-                continue;
-            if (sim.jobBoard.HasActiveJobOnTarget(tilePos, JobType.MineStone))
-                continue;
-
-            sim.jobBoard.AddJob(new SimJob
-            {
-                Type = JobType.MineStone,
-                Priority = JobPriority.Normal,
-                Target = tilePos
-            });
-            added++;
-        }
+        _mineSelectionSortBuffer.Clear();
+        BuildOrderedMineSelection(_selectedTerrainTiles, _mineSelectionSortBuffer);
+        int before = sim.jobBoard.ActiveJobCount;
+        _commandPipeline.QueueMine(_mineSelectionSortBuffer, JobPriority.Normal);
+        int added = Mathf.Max(0, sim.jobBoard.ActiveJobCount - before);
 
         if (added > 0)
             GD.Print($"[Jobs] {added} job(s) minage ajouté(s) (file : {sim.jobBoard.ActiveJobCount})");
@@ -2072,38 +2929,13 @@ public partial class Game : Node3D
 
     void RefreshJobsQueueUi()
     {
-        if (_jobsQueueLabel == null || sim?.jobBoard == null)
+        if (_uiModule == null || sim == null)
             return;
 
-        sim.jobBoard.CopyActiveJobs(_jobsUiBuffer);
-        if (_jobsUiBuffer.Count == 0)
-        {
-            _jobsQueueLabel.Text = "Travail en attente : aucun";
-            return;
-        }
-
-        var sb = new System.Text.StringBuilder();
-        sb.Append("Travail en attente (").Append(_jobsUiBuffer.Count).Append(") :\n");
-        const int maxLines = 6;
-        int shown = 0;
-        foreach (var j in _jobsUiBuffer)
-        {
-            if (shown >= maxLines)
-            {
-                sb.Append("…");
-                break;
-            }
-            string state = j.Status == JobStatus.Reserved ? "en cours" : "à faire";
-            string line = j.Type switch
-            {
-                JobType.CutTree => $"• Coupe arbre @ {j.Target} ({state})",
-                JobType.MineStone => $"• Mine bloc @ {j.Target} ({state})",
-                _ => $"• {j.Type} @ {j.Target} ({state})"
-            };
-            sb.AppendLine(line);
-            shown++;
-        }
-        _jobsQueueLabel.Text = sb.ToString().TrimEnd();
+        if (_jobsQueueLabel != null)
+            _jobsQueueLabel.Text = _uiModule.BuildJobsQueueText(sim);
+        if (_logisticsLabel != null)
+            _logisticsLabel.Text = _uiModule.BuildLogisticsText(sim);
     }
 
     void RefreshTreeJobOverlays()
@@ -2174,6 +3006,9 @@ public partial class Game : Node3D
             "stone" => new Color(0.45f, 0.45f, 0.48f),
             "tree" => new Color(0.15f, 0.45f, 0.12f),
             "platform" => new Color(0.4f, 0.24f, 0.11f),
+            "scaffold" => new Color(0.68f, 0.53f, 0.32f),
+            // Noir pur = trop dur à lire visuellement avec les ombres.
+            "build_black" => new Color(0.07f, 0.07f, 0.08f),
             "stairs" => new Color(0.38f, 0.22f, 0.1f),
             "air" => new Color(0.1f, 0.1f, 0.8f),
             _ => new Color(1, 1, 1)
