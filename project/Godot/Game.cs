@@ -5,7 +5,21 @@ using System.Diagnostics;
 
 public partial class Game : Node3D
 {
-    const int CHUNK_VISIBILITY_INTERVAL_TICKS = 1;
+    public enum ChunkQualityProfile
+    {
+        Auto,
+        Low,
+        Medium,
+        High
+    }
+
+    [ExportGroup("Chunk Visibility Update")]
+    /// <summary>Fréquence de mise à jour de la visibilité des chunks (en ticks simulation).</summary>
+    [Export(PropertyHint.Range, "1,12,1")]
+    public int ChunkVisibilityIntervalTicks = 2;
+    /// <summary>Nombre max de chunks évalués par passe de visibilité.</summary>
+    [Export(PropertyHint.Range, "16,2048,16")]
+    public int ChunkVisibilityBatchSize = 192;
     /// <summary>Tuile posée par le mode Build : même identifiant pour le job, le mesh terrain et la couleur du fantôme.</summary>
     const string BuildPlacementTileType = "build_black";
 
@@ -37,12 +51,80 @@ public partial class Game : Node3D
     Dictionary<Vector3I, Node3D> spawnedTiles = new();
 
     [Export] public int ChunkLoadRadius = 2;
+    [ExportGroup("Chunk Quality Profiles")]
+    /// <summary>Active l'adaptation automatique de la qualité chunk selon la machine au lancement.</summary>
+    [Export] public bool AdaptiveChunkQualityEnabled = true;
+    /// <summary>Permet de forcer un profil. Auto = détection machine.</summary>
+    [Export] public ChunkQualityProfile ChunkQualityProfileOverride = ChunkQualityProfile.Auto;
+    /// <summary>Écrit le profil choisi dans user://video_settings.cfg pour garder le même réglage au prochain lancement.</summary>
+    [Export] public bool SaveDetectedChunkQualityProfile = true;
+    /// <summary>Recharge un profil déjà sauvegardé si aucun override manuel n'est défini.</summary>
+    [Export] public bool LoadSavedChunkQualityProfile = true;
+    [ExportGroup("Chunk Runtime Tuning")]
+    /// <summary>Ajuste automatiquement le budget de spawn chunk selon le FPS mesuré.</summary>
+    [Export] public bool AdaptiveChunkSpawnBudgetEnabled = true;
+    [Export(PropertyHint.Range, "20,120,1")]
+    public int AdaptiveChunkSpawnTargetFps = 60;
+    [Export(PropertyHint.Range, "8,512,1")]
+    public int AdaptiveChunkSpawnMinBudget = 32;
+    [Export(PropertyHint.Range, "8,512,1")]
+    public int AdaptiveChunkSpawnMaxBudget = 196;
+    [Export(PropertyHint.Range, "1,64,1")]
+    public int AdaptiveChunkSpawnStep = 8;
+    [Export(PropertyHint.Range, "0.1,2,0.1")]
+    public float AdaptiveChunkSpawnAdjustIntervalSeconds = 0.5f;
+    [ExportGroup("Chunk Camera Trajectory Prefetch")]
+    /// <summary>Précharge des chunks dans la trajectoire de la caméra pour éviter les trous lors des déplacements rapides.</summary>
+    [Export] public bool ChunkCameraTrajectoryPrefetchEnabled = true;
+    /// <summary>Horizon de prédiction (secondes) utilisé pour le lookahead caméra.</summary>
+    [Export(PropertyHint.Range, "0.05,1.5,0.05")]
+    public float ChunkCameraLookaheadSeconds = 0.35f;
+    /// <summary>Distance max de lookahead exprimée en nombre de chunks.</summary>
+    [Export(PropertyHint.Range, "1,6,1")]
+    public int ChunkCameraLookaheadMaxChunks = 2;
+    [ExportGroup("Perf Benchmark")]
+    [Export] public bool PerformanceBenchmarkEnabled = true;
+    [Export(PropertyHint.Range, "10,180,1")]
+    public int PerformanceBenchmarkDurationSeconds = 60;
+    [Export(PropertyHint.Range, "0.1,2,0.1")]
+    public float PerformanceBenchmarkSampleIntervalSeconds = 0.5f;
+    [Export] public bool PerformanceBenchmarkSuiteEnabled = true;
+    [Export] public bool PerformanceBenchmarkSuiteAutoCameraPath = true;
+    [Export(PropertyHint.Range, "2,60,1")]
+    public float PerformanceBenchmarkCameraPathRadiusX = 22f;
+    [Export(PropertyHint.Range, "2,60,1")]
+    public float PerformanceBenchmarkCameraPathRadiusZ = 16f;
+    [Export(PropertyHint.Range, "0.05,2,0.05")]
+    public float PerformanceBenchmarkCameraPathSpeed = 0.35f;
+    [Export(PropertyHint.Range, "0,20,0.5")]
+    public float PerformanceBenchmarkCameraPathVerticalAmplitude = 3f;
     /// <summary>Rayon supplémentaire (en chunks) autour des colons + pivot caméra pour éviter les trous quand la vue dépasse le colon.</summary>
     [Export] public int ChunkPreloadMargin = 1;
     /// <summary>Couches de chunks au-dessus / en-dessous du colon et de la caméra (grottes, hauteur Y).</summary>
     [Export] public int ChunkVerticalLoadMargin = 1;
     /// <summary>À moins de N tuiles d’une face de chunk, précharge aussi la colonne de chunks voisine (vue au bord).</summary>
     [Export] public int ChunkEdgePrefetchTiles = 8;
+    /// <summary>Active le culling rendu par distance caméra (les chunks restent chargés pour éviter les trous de streaming).</summary>
+    [Export] public bool ChunkDistanceCullingEnabled = true;
+    /// <summary>Distance max (en unités monde) entre la caméra et le centre d'un chunk pour l'afficher.</summary>
+    [Export] public float ChunkRenderDistance = 150f;
+    /// <summary>Active le culling rendu par frustum caméra.</summary>
+    [Export] public bool ChunkFrustumCullingEnabled = true;
+    /// <summary>Marge de tolérance monde pour éviter le pop agressif au bord du frustum.</summary>
+    [Export] public float ChunkFrustumPadding = 4f;
+    /// <summary>Maintient brièvement un chunk visible quand il sort du culling pour éviter le clignotement.</summary>
+    [Export] public bool ChunkVisibilityHysteresisEnabled = true;
+    /// <summary>Durée de grâce (secondes) avant de masquer un chunk après sortie du culling.</summary>
+    [Export(PropertyHint.Range, "0,1,0.01")]
+    public float ChunkHideGraceSeconds = 0.2f;
+    /// <summary>Active la priorisation de streaming selon la direction caméra (devant en premier).</summary>
+    [Export] public bool ChunkDirectionalStreamingEnabled = true;
+    /// <summary>Poids appliqué aux chunks situés derrière la caméra (0.1 = très dépriorisés, 1 = neutre).</summary>
+    [Export(PropertyHint.Range, "0.1,1,0.05")]
+    public float ChunkBehindCameraWeight = 0.35f;
+    /// <summary>Nombre max de nouveaux chunks meshés à chaque refresh pour lisser les pics.</summary>
+    [Export(PropertyHint.Range, "8,512,1")]
+    public int ChunkSpawnBudgetPerRefresh = 96;
     /// <summary>Rayon de la vision des colons en tuiles (sphère, LOS par tuile).</summary>
     [Export(PropertyHint.Range, "4,40,1")]
     public int ColonistVisionRadiusTiles = 12;
@@ -128,8 +210,49 @@ public partial class Game : Node3D
     Shader _terrainSmartCutShader;
     int lastChunkRefreshTick = -1;
     int lastChunkVisibilityTick = -1;
+    int _chunkVisibilityCursor = 0;
+    readonly List<Vector3I> _chunkVisibilityKeysScratch = new();
     long lastChunkRefreshMicroseconds = 0;
     int lastNeededChunkCount = 0;
+    int _lastRenderedChunkCount = 0;
+    int _lastCulledDistanceChunkCount = 0;
+    int _lastCulledFrustumChunkCount = 0;
+    int _lastHysteresisKeptChunkCount = 0;
+    int _lastSpawnedChunkCount = 0;
+    int _lastSpawnPendingChunkCount = 0;
+    int _runtimeChunkSpawnBudget = 96;
+    float _spawnBudgetAdjustTimer = 0f;
+    bool _hasPrevCameraPivotPos = false;
+    Vector3 _prevCameraPivotPos = Vector3.Zero;
+    double _lastCameraPrefetchSampleTimeSec = -1.0;
+    Vector3 _smoothedCameraVelocity = Vector3.Zero;
+    int _lastCameraLookaheadOrigins = 0;
+    bool _perfBenchmarkRunning = false;
+    double _perfBenchmarkElapsedSec = 0.0;
+    double _perfBenchmarkSampleTimerSec = 0.0;
+    int _perfBenchmarkSampleCount = 0;
+    double _perfBenchmarkFpsSum = 0.0;
+    int _perfBenchmarkFpsMin = int.MaxValue;
+    int _perfBenchmarkFpsMax = 0;
+    int _perfBenchmarkFrameCount = 0;
+    double _perfBenchmarkFrameMsSum = 0.0;
+    double _perfBenchmarkFrameMsMax = 0.0;
+    double _perfBenchmarkActiveChunksSum = 0.0;
+    double _perfBenchmarkRenderedChunksSum = 0.0;
+    double _perfBenchmarkCulledDistSum = 0.0;
+    double _perfBenchmarkCulledFrustumSum = 0.0;
+    double _perfBenchmarkSpawnedSum = 0.0;
+    double _perfBenchmarkPendingSpawnSum = 0.0;
+    bool _perfBenchmarkSuiteRunning = false;
+    int _perfBenchmarkSuiteIndex = -1;
+    string _perfBenchmarkRunLabel = "single";
+    bool _benchmarkAutoCameraPathActive = false;
+    double _benchmarkAutoCameraPathElapsedSec = 0.0;
+    bool _hasBenchmarkSuiteCameraOrigin = false;
+    Vector3 _benchmarkSuiteCameraOrigin = Vector3.Zero;
+    readonly Dictionary<Vector3I, double> _chunkHideGraceUntilByPos = new();
+    ChunkQualityProfile _activeChunkQualityProfile = ChunkQualityProfile.Auto;
+    string _activeChunkQualityReason = "scene_defaults";
     float lastFrameDeltaSeconds = 0f;
 
     WorldSelectionTargetKind _selectionTargetKind = WorldSelectionTargetKind.Colonists;
@@ -198,6 +321,18 @@ public partial class Game : Node3D
     Label _logisticsLabel;
     Label _terrainTileLabel;
     Label _buildStatusLabel;
+    Label _perfProfileLabel;
+    VBoxContainer _perfControlsBox;
+    OptionButton _perfProfileOption;
+    CheckBox _perfAdaptiveBudgetCheck;
+    CheckBox _perfTrajectoryPrefetchCheck;
+    HSlider _perfRenderDistanceSlider;
+    Label _perfRenderDistanceValueLabel;
+    HSlider _perfSpawnBudgetSlider;
+    Label _perfSpawnBudgetValueLabel;
+    HSlider _perfHideGraceSlider;
+    Label _perfHideGraceValueLabel;
+    bool _isSyncingPerfUi = false;
     readonly List<SimJob> _jobsUiBuffer = new();
 
     private Simulation _simulation;
@@ -215,6 +350,7 @@ public partial class Game : Node3D
     {
         cameraPivot = GetNode<Node3D>("CameraPivot");
         camera = GetNode<Camera3D>("CameraPivot/Camera3D");
+        ApplyChunkQualityProfileAtStartup();
 
         // Sinon le StaticBody3D « Ground » (calque 1 par défaut) mange le raycast avant les chunks voxel.
         var debugGround = GetNodeOrNull<StaticBody3D>("Ground");
@@ -241,6 +377,7 @@ public partial class Game : Node3D
         _logisticsLabel = GetNodeOrNull<Label>("UI/SelectionPanel/VBox/LogisticsLabel");
         _terrainTileLabel = GetNodeOrNull<Label>("UI/SelectionPanel/VBox/TerrainTileLabel");
         _buildStatusLabel = GetNodeOrNull<Label>("UI/SelectionPanel/VBox/BuildStatusLabel");
+        _perfProfileLabel = GetNodeOrNull<Label>("UI/SelectionPanel/VBox/PerfProfileLabel");
         if (_logisticsLabel == null)
         {
             var vbox = GetNodeOrNull<VBoxContainer>("UI/SelectionPanel/VBox");
@@ -250,6 +387,18 @@ public partial class Game : Node3D
                 vbox.AddChild(_logisticsLabel);
             }
         }
+        if (_perfProfileLabel == null)
+        {
+            var vbox = GetNodeOrNull<VBoxContainer>("UI/SelectionPanel/VBox");
+            if (vbox != null)
+            {
+                _perfProfileLabel = new Label { Name = "PerfProfileLabel" };
+                vbox.AddChild(_perfProfileLabel);
+            }
+        }
+        InitPerformanceControlsUi();
+        LoadSavedPerformanceRuntimeSettings();
+        SyncPerformanceControlsFromState();
         if (_btnModeColonists != null)
             _btnModeColonists.Pressed += () => SetSelectionTargetKind(WorldSelectionTargetKind.Colonists);
         if (_btnModeTrees != null)
@@ -319,6 +468,8 @@ public partial class Game : Node3D
 
         lastFrameDeltaSeconds = (float)delta;
         accumulator += delta;
+        UpdateAdaptiveChunkSpawnBudget((float)delta);
+        UpdatePerformanceBenchmark((float)delta);
 
         bool tickAdvanced = false;
         while (accumulator >= TICK_RATE)
@@ -344,7 +495,8 @@ public partial class Game : Node3D
             if (_verticalSliceTerrainActive)
                 ApplyMultimeshOcclusionPeels();
         }
-        if (tickAdvanced && sim.Tick % CHUNK_VISIBILITY_INTERVAL_TICKS == 0 && sim.Tick != lastChunkVisibilityTick)
+        int visibilityInterval = Mathf.Max(1, ChunkVisibilityIntervalTicks);
+        if (tickAdvanced && sim.Tick % visibilityInterval == 0 && sim.Tick != lastChunkVisibilityTick)
         {
             UpdateChunkVisibility();
             lastChunkVisibilityTick = sim.Tick;
@@ -355,9 +507,11 @@ public partial class Game : Node3D
         bool hasFollow = TryGetCameraFollowPoint(out Vector3 followPos);
         cameraController.SetFocusPoint(followPos, hasFollow);
         cameraController.Update(delta);
+        UpdateBenchmarkAutoCameraPath((float)delta);
         bool hasCutFocus = TryGetSmartCutFocusPoint(out Vector3 cutFocus);
         UpdateSmartCutShaderParameters(hasCutFocus, cutFocus);
         RefreshJobsQueueUi();
+        RefreshPerformanceProfileLabel();
         RefreshTreeJobOverlays();
         if (_verticalSliceTerrainActive || _verticalSliceTerrainWasActive || _terrainOcclusionHidden.Count > 0)
             ApplyMultimeshOcclusionPeels();
@@ -592,8 +746,37 @@ public partial class Game : Node3D
 
             if (key.Keycode == Key.F11)
             {
-                GD.Print($"CHUNK METRICS active={_chunkVisuals.Count} needed={lastNeededChunkCount} last_us={lastChunkRefreshMicroseconds}");
+                GD.Print(
+                    $"CHUNK METRICS active={_chunkVisuals.Count} needed={lastNeededChunkCount} " +
+                    $"rendered={_lastRenderedChunkCount} culled_dist={_lastCulledDistanceChunkCount} " +
+                    $"culled_frustum={_lastCulledFrustumChunkCount} hysteresis_kept={_lastHysteresisKeptChunkCount} " +
+                    $"spawned={_lastSpawnedChunkCount} " +
+                    $"pending_spawn={_lastSpawnPendingChunkCount} spawn_budget={_runtimeChunkSpawnBudget} " +
+                    $"lookahead_origins={_lastCameraLookaheadOrigins} " +
+                    $"benchmark_running={_perfBenchmarkRunning} suite_running={_perfBenchmarkSuiteRunning} " +
+                    $"benchmark_t={_perfBenchmarkElapsedSec:0.0}s " +
+                    $"profile={_activeChunkQualityProfile} " +
+                    $"profile_reason={_activeChunkQualityReason} last_us={lastChunkRefreshMicroseconds}");
             }
+
+            if (key.Keycode == Key.F4)
+            {
+                if (_perfBenchmarkSuiteRunning)
+                    CancelPerformanceBenchmarkSuite();
+                else
+                    StartPerformanceBenchmarkSuite();
+            }
+
+            if (key.Keycode == Key.F5)
+            {
+                if (_perfBenchmarkRunning)
+                    StopPerformanceBenchmark(completed: false);
+                else
+                    StartPerformanceBenchmark();
+            }
+
+            if (key.Keycode == Key.F6)
+                CycleChunkQualityProfileHotkey();
 
             if (key.Keycode == Key.F7)
             {
@@ -1190,7 +1373,10 @@ public partial class Game : Node3D
         }
 
         foreach (var pos in toRemove)
+        {
             _chunkVisuals.Remove(pos);
+            _chunkHideGraceUntilByPos.Remove(pos);
+        }
     }
 
     void SpawnChunkDebug(Vector3I chunkPos, Chunk chunk)
@@ -1222,6 +1408,7 @@ public partial class Game : Node3D
     {
         var map = sim.World.CurrentMap;
         currentNeededChunks.Clear();
+        _lastCameraLookaheadOrigins = 0;
 
         int r = ChunkLoadRadius + Mathf.Max(0, ChunkPreloadMargin);
         int vy = Mathf.Max(0, ChunkVerticalLoadMargin);
@@ -1275,10 +1462,727 @@ public partial class Game : Node3D
             int cy = Mathf.FloorToInt(gp.Y / Map.CHUNK_SIZE);
             int cz = Mathf.FloorToInt(gp.Z / Map.CHUNK_SIZE);
             AddChunkColumnNeighborhood(cx, cy, cz);
+
+            if (ChunkCameraTrajectoryPrefetchEnabled)
+            {
+                double nowSec = Time.GetTicksMsec() * 0.001;
+                if (_hasPrevCameraPivotPos && _lastCameraPrefetchSampleTimeSec > 0.0)
+                {
+                    double dt = nowSec - _lastCameraPrefetchSampleTimeSec;
+                    if (dt > 0.0001)
+                    {
+                        Vector3 instantVel = (gp - _prevCameraPivotPos) / (float)dt;
+                        _smoothedCameraVelocity = _smoothedCameraVelocity.Lerp(instantVel, 0.25f);
+                    }
+                }
+
+                _prevCameraPivotPos = gp;
+                _hasPrevCameraPivotPos = true;
+                _lastCameraPrefetchSampleTimeSec = nowSec;
+
+                float maxLookaheadDist = Mathf.Max(1, ChunkCameraLookaheadMaxChunks) * Map.CHUNK_SIZE;
+                Vector3 offset = _smoothedCameraVelocity * Mathf.Max(0.05f, ChunkCameraLookaheadSeconds);
+                float len = offset.Length();
+                if (len > 0.25f)
+                {
+                    if (len > maxLookaheadDist)
+                        offset = offset / len * maxLookaheadDist;
+
+                    int steps = 3;
+                    for (int i = 1; i <= steps; i++)
+                    {
+                        float t = i / (float)steps;
+                        Vector3 p = gp + offset * t;
+                        int lx = Mathf.FloorToInt(p.X / Map.CHUNK_SIZE);
+                        int ly = Mathf.FloorToInt(p.Y / Map.CHUNK_SIZE);
+                        int lz = Mathf.FloorToInt(p.Z / Map.CHUNK_SIZE);
+                        AddChunkColumnNeighborhood(lx, ly, lz);
+                        _lastCameraLookaheadOrigins++;
+                    }
+                }
+            }
         }
 
+        var spawnCandidates = new List<Vector3I>();
         foreach (var chunkPos in currentNeededChunks)
+        {
+            if (!_chunkVisuals.ContainsKey(chunkPos))
+                spawnCandidates.Add(chunkPos);
+        }
+
+        if (ChunkDirectionalStreamingEnabled && spawnCandidates.Count > 1)
+        {
+            spawnCandidates.Sort((a, b) =>
+            {
+                float sb = ComputeChunkStreamingScore(b);
+                float sa = ComputeChunkStreamingScore(a);
+                int cmp = sb.CompareTo(sa);
+                if (cmp != 0)
+                    return cmp;
+                // Tie-break deterministic.
+                cmp = a.X.CompareTo(b.X);
+                if (cmp != 0)
+                    return cmp;
+                cmp = a.Y.CompareTo(b.Y);
+                if (cmp != 0)
+                    return cmp;
+                return a.Z.CompareTo(b.Z);
+            });
+        }
+
+        int budget = _runtimeChunkSpawnBudget <= 0
+            ? spawnCandidates.Count
+            : Mathf.Min(_runtimeChunkSpawnBudget, spawnCandidates.Count);
+        _lastSpawnPendingChunkCount = spawnCandidates.Count - budget;
+        _lastSpawnedChunkCount = 0;
+        for (int i = 0; i < budget; i++)
+        {
+            var chunkPos = spawnCandidates[i];
             SpawnChunkMesh(chunkPos, map.GetOrCreateChunk(chunkPos));
+            _lastSpawnedChunkCount++;
+        }
+    }
+
+    float ComputeChunkStreamingScore(Vector3I chunkPos)
+    {
+        if (camera == null)
+            return 0f;
+
+        Vector3 toChunk = GetChunkCenterWorld(chunkPos) - camera.GlobalPosition;
+        float distSq = Mathf.Max(1f, toChunk.LengthSquared());
+        Vector3 dir = toChunk / Mathf.Sqrt(distSq);
+        float forward = dir.Dot(-camera.GlobalTransform.Basis.Z);
+        float orientationWeight = forward >= 0f
+            ? 1f + forward
+            : Mathf.Lerp(ChunkBehindCameraWeight, 1f, forward + 1f);
+        return orientationWeight / distSq;
+    }
+
+    void ApplyChunkQualityProfileAtStartup()
+    {
+        if (!AdaptiveChunkQualityEnabled)
+        {
+            _activeChunkQualityProfile = ChunkQualityProfile.Auto;
+            _activeChunkQualityReason = "adaptive_disabled";
+            GD.Print("[Perf] Adaptive chunk quality disabled; using scene values.");
+            return;
+        }
+
+        if (ChunkQualityProfileOverride != ChunkQualityProfile.Auto)
+        {
+            ApplyChunkQualityProfile(ChunkQualityProfileOverride, "manual_override");
+            if (SaveDetectedChunkQualityProfile)
+                SaveChunkQualityProfileSetting(_activeChunkQualityProfile);
+            return;
+        }
+
+        if (LoadSavedChunkQualityProfile && TryLoadSavedChunkQualityProfile(out var savedProfile))
+        {
+            ApplyChunkQualityProfile(savedProfile, "saved_profile");
+            return;
+        }
+
+        ChunkQualityProfile detected = DetectChunkQualityProfile();
+        ApplyChunkQualityProfile(detected, "auto_detect");
+        if (SaveDetectedChunkQualityProfile)
+            SaveChunkQualityProfileSetting(detected);
+    }
+
+    ChunkQualityProfile DetectChunkQualityProfile()
+    {
+        int cpu = OS.GetProcessorCount();
+        string renderer = RenderingServer.GetCurrentRenderingMethod().ToLowerInvariant();
+        bool heavyRenderer = renderer.Contains("forward_plus");
+        bool mobileLikeRenderer = renderer.Contains("mobile");
+
+        // Heuristique conservative: évite de surclasser "High" sans preuve.
+        if (cpu <= 6 || mobileLikeRenderer)
+            return ChunkQualityProfile.Low;
+        if (cpu >= 22 && heavyRenderer)
+            return ChunkQualityProfile.High;
+        return ChunkQualityProfile.Medium;
+    }
+
+    void ApplyChunkQualityProfile(ChunkQualityProfile profile, string reason)
+    {
+        switch (profile)
+        {
+            case ChunkQualityProfile.Low:
+                ChunkLoadRadius = 2;
+                ChunkPreloadMargin = 0;
+                ChunkVerticalLoadMargin = 1;
+                ChunkEdgePrefetchTiles = 4;
+                ChunkDistanceCullingEnabled = true;
+                ChunkRenderDistance = 90f;
+                ChunkFrustumCullingEnabled = true;
+                ChunkFrustumPadding = 2f;
+                ChunkDirectionalStreamingEnabled = true;
+                ChunkBehindCameraWeight = 0.2f;
+                ChunkSpawnBudgetPerRefresh = 40;
+                ChunkVisibilityIntervalTicks = 3;
+                ChunkVisibilityBatchSize = 128;
+                break;
+
+            case ChunkQualityProfile.High:
+                ChunkLoadRadius = 2;
+                ChunkPreloadMargin = 0;
+                ChunkVerticalLoadMargin = 1;
+                ChunkEdgePrefetchTiles = 7;
+                ChunkDistanceCullingEnabled = true;
+                ChunkRenderDistance = 150f;
+                ChunkFrustumCullingEnabled = true;
+                ChunkFrustumPadding = 4f;
+                ChunkDirectionalStreamingEnabled = true;
+                ChunkBehindCameraWeight = 0.4f;
+                ChunkSpawnBudgetPerRefresh = 96;
+                ChunkVisibilityIntervalTicks = 2;
+                ChunkVisibilityBatchSize = 192;
+                break;
+
+            default:
+                profile = ChunkQualityProfile.Medium;
+                ChunkLoadRadius = 2;
+                ChunkPreloadMargin = 0;
+                ChunkVerticalLoadMargin = 1;
+                ChunkEdgePrefetchTiles = 6;
+                ChunkDistanceCullingEnabled = true;
+                ChunkRenderDistance = 130f;
+                ChunkFrustumCullingEnabled = true;
+                ChunkFrustumPadding = 3f;
+                ChunkDirectionalStreamingEnabled = true;
+                ChunkBehindCameraWeight = 0.3f;
+                ChunkSpawnBudgetPerRefresh = 72;
+                ChunkVisibilityIntervalTicks = 2;
+                ChunkVisibilityBatchSize = 160;
+                break;
+        }
+
+        _activeChunkQualityProfile = profile;
+        _activeChunkQualityReason = reason;
+        _runtimeChunkSpawnBudget = Mathf.Clamp(
+            ChunkSpawnBudgetPerRefresh,
+            Mathf.Max(8, AdaptiveChunkSpawnMinBudget),
+            Mathf.Max(Mathf.Max(8, AdaptiveChunkSpawnMinBudget), AdaptiveChunkSpawnMaxBudget));
+        GD.Print(
+            $"[Perf] Chunk profile={_activeChunkQualityProfile} reason={reason} " +
+            $"cpu={OS.GetProcessorCount()} memMb={OS.GetStaticMemoryUsage() / (1024 * 1024)} " +
+            $"renderer={RenderingServer.GetCurrentRenderingMethod()}");
+    }
+
+    void CycleChunkQualityProfileHotkey()
+    {
+        ChunkQualityProfile next = _activeChunkQualityProfile switch
+        {
+            ChunkQualityProfile.Low => ChunkQualityProfile.Medium,
+            ChunkQualityProfile.Medium => ChunkQualityProfile.High,
+            _ => ChunkQualityProfile.Low
+        };
+
+        ChunkQualityProfileOverride = next;
+        ApplyChunkQualityProfile(next, "hotkey_cycle");
+        if (SaveDetectedChunkQualityProfile)
+            SavePerformanceRuntimeSettings();
+        RefreshPerformanceProfileLabel();
+        SyncPerformanceControlsFromState();
+        GD.Print($"[Perf] Switched chunk profile to {next} (F6).");
+    }
+
+    void UpdateAdaptiveChunkSpawnBudget(float delta)
+    {
+        if (!AdaptiveChunkSpawnBudgetEnabled)
+        {
+            _runtimeChunkSpawnBudget = ChunkSpawnBudgetPerRefresh;
+            return;
+        }
+
+        _spawnBudgetAdjustTimer += delta;
+        float interval = Mathf.Max(0.1f, AdaptiveChunkSpawnAdjustIntervalSeconds);
+        if (_spawnBudgetAdjustTimer < interval)
+            return;
+        _spawnBudgetAdjustTimer = 0f;
+
+        int fps = Mathf.RoundToInt((float)Engine.GetFramesPerSecond());
+        int minBudget = Mathf.Max(8, AdaptiveChunkSpawnMinBudget);
+        int maxBudget = Mathf.Max(minBudget, AdaptiveChunkSpawnMaxBudget);
+        int step = Mathf.Max(1, AdaptiveChunkSpawnStep);
+        int target = Mathf.Max(20, AdaptiveChunkSpawnTargetFps);
+
+        int budget = Mathf.Clamp(_runtimeChunkSpawnBudget, minBudget, maxBudget);
+        if (fps < target - 3)
+            budget = Mathf.Max(minBudget, budget - step);
+        else if (fps > target + 6 && _lastSpawnPendingChunkCount > 0)
+            budget = Mathf.Min(maxBudget, budget + step);
+
+        _runtimeChunkSpawnBudget = budget;
+    }
+
+    void RefreshPerformanceProfileLabel()
+    {
+        if (_perfProfileLabel == null)
+            return;
+
+        string benchmarkSuffix = _perfBenchmarkRunning
+            ? $" | BENCH {_perfBenchmarkElapsedSec:0.0}/{PerformanceBenchmarkDurationSeconds}s ({_perfBenchmarkRunLabel})"
+            : string.Empty;
+        _perfProfileLabel.Text =
+            $"Perf: {_activeChunkQualityProfile} ({_activeChunkQualityReason}) | " +
+            $"SpawnBudget={_runtimeChunkSpawnBudget} | FPS={Engine.GetFramesPerSecond()}{benchmarkSuffix}";
+    }
+
+    void StartPerformanceBenchmark(string runLabel = "single")
+    {
+        if (!PerformanceBenchmarkEnabled)
+        {
+            GD.Print("[PerfBenchmark] Disabled via export flag.");
+            return;
+        }
+
+        _perfBenchmarkRunning = true;
+        _perfBenchmarkElapsedSec = 0.0;
+        _perfBenchmarkSampleTimerSec = 0.0;
+        _perfBenchmarkSampleCount = 0;
+        _perfBenchmarkFpsSum = 0.0;
+        _perfBenchmarkFpsMin = int.MaxValue;
+        _perfBenchmarkFpsMax = 0;
+        _perfBenchmarkFrameCount = 0;
+        _perfBenchmarkFrameMsSum = 0.0;
+        _perfBenchmarkFrameMsMax = 0.0;
+        _perfBenchmarkActiveChunksSum = 0.0;
+        _perfBenchmarkRenderedChunksSum = 0.0;
+        _perfBenchmarkCulledDistSum = 0.0;
+        _perfBenchmarkCulledFrustumSum = 0.0;
+        _perfBenchmarkSpawnedSum = 0.0;
+        _perfBenchmarkPendingSpawnSum = 0.0;
+        _perfBenchmarkRunLabel = runLabel;
+
+        GD.Print($"[PerfBenchmark] Started run={runLabel} duration={PerformanceBenchmarkDurationSeconds}s sampleInterval={PerformanceBenchmarkSampleIntervalSeconds:0.00}s");
+    }
+
+    void StopPerformanceBenchmark(bool completed)
+    {
+        if (!_perfBenchmarkRunning && !completed)
+            return;
+
+        _perfBenchmarkRunning = false;
+        PrintPerformanceBenchmarkSummary(completed);
+
+        if (_perfBenchmarkSuiteRunning)
+        {
+            if (completed)
+                StartNextProfileInBenchmarkSuite();
+            else
+                CancelPerformanceBenchmarkSuite();
+        }
+    }
+
+    void UpdatePerformanceBenchmark(float delta)
+    {
+        if (!_perfBenchmarkRunning)
+            return;
+
+        _perfBenchmarkElapsedSec += delta;
+        _perfBenchmarkSampleTimerSec += delta;
+        _perfBenchmarkFrameCount++;
+
+        double frameMs = delta * 1000.0;
+        _perfBenchmarkFrameMsSum += frameMs;
+        if (frameMs > _perfBenchmarkFrameMsMax)
+            _perfBenchmarkFrameMsMax = frameMs;
+
+        float interval = Mathf.Max(0.1f, PerformanceBenchmarkSampleIntervalSeconds);
+        if (_perfBenchmarkSampleTimerSec >= interval)
+        {
+            _perfBenchmarkSampleTimerSec = 0.0;
+            int fps = Mathf.RoundToInt((float)Engine.GetFramesPerSecond());
+            _perfBenchmarkSampleCount++;
+            _perfBenchmarkFpsSum += fps;
+            _perfBenchmarkFpsMin = Mathf.Min(_perfBenchmarkFpsMin, fps);
+            _perfBenchmarkFpsMax = Mathf.Max(_perfBenchmarkFpsMax, fps);
+            _perfBenchmarkActiveChunksSum += _chunkVisuals.Count;
+            _perfBenchmarkRenderedChunksSum += _lastRenderedChunkCount;
+            _perfBenchmarkCulledDistSum += _lastCulledDistanceChunkCount;
+            _perfBenchmarkCulledFrustumSum += _lastCulledFrustumChunkCount;
+            _perfBenchmarkSpawnedSum += _lastSpawnedChunkCount;
+            _perfBenchmarkPendingSpawnSum += _lastSpawnPendingChunkCount;
+        }
+
+        if (_perfBenchmarkElapsedSec >= Mathf.Max(1, PerformanceBenchmarkDurationSeconds))
+            StopPerformanceBenchmark(completed: true);
+    }
+
+    void PrintPerformanceBenchmarkSummary(bool completed)
+    {
+        int n = Mathf.Max(1, _perfBenchmarkSampleCount);
+        double avgFps = _perfBenchmarkFpsSum / n;
+        double avgFrameMs = _perfBenchmarkFrameMsSum / Math.Max(1, _perfBenchmarkFrameCount);
+        double avgActive = _perfBenchmarkActiveChunksSum / n;
+        double avgRendered = _perfBenchmarkRenderedChunksSum / n;
+        double avgCulledDist = _perfBenchmarkCulledDistSum / n;
+        double avgCulledFrustum = _perfBenchmarkCulledFrustumSum / n;
+        double avgSpawned = _perfBenchmarkSpawnedSum / n;
+        double avgPending = _perfBenchmarkPendingSpawnSum / n;
+        string state = completed ? "completed" : "cancelled";
+        int fpsMin = _perfBenchmarkFpsMin == int.MaxValue ? 0 : _perfBenchmarkFpsMin;
+
+        GD.Print(
+            $"[PerfBenchmark] run={_perfBenchmarkRunLabel} {state} dur={_perfBenchmarkElapsedSec:0.0}s samples={_perfBenchmarkSampleCount} " +
+            $"fps_avg={avgFps:0.0} fps_min={fpsMin} fps_max={_perfBenchmarkFpsMax} " +
+            $"frame_ms_avg={avgFrameMs:0.00} frame_ms_max={_perfBenchmarkFrameMsMax:0.00} " +
+            $"chunks_active_avg={avgActive:0.0} rendered_avg={avgRendered:0.0} " +
+            $"culled_dist_avg={avgCulledDist:0.0} culled_frustum_avg={avgCulledFrustum:0.0} " +
+            $"spawned_avg={avgSpawned:0.0} pending_avg={avgPending:0.0} " +
+            $"profile={_activeChunkQualityProfile} reason={_activeChunkQualityReason}");
+    }
+
+    void StartPerformanceBenchmarkSuite()
+    {
+        if (!PerformanceBenchmarkSuiteEnabled)
+        {
+            GD.Print("[PerfBenchmarkSuite] Disabled via export flag.");
+            return;
+        }
+        if (_perfBenchmarkRunning)
+        {
+            GD.Print("[PerfBenchmarkSuite] Stop current benchmark before starting suite.");
+            return;
+        }
+
+        _perfBenchmarkSuiteRunning = true;
+        _perfBenchmarkSuiteIndex = -1;
+        _hasBenchmarkSuiteCameraOrigin = false;
+        _benchmarkAutoCameraPathActive = false;
+        GD.Print("[PerfBenchmarkSuite] Starting suite: Low -> Medium -> High");
+        StartNextProfileInBenchmarkSuite();
+    }
+
+    void StartNextProfileInBenchmarkSuite()
+    {
+        _perfBenchmarkSuiteIndex++;
+        if (_perfBenchmarkSuiteIndex >= 3)
+        {
+            GD.Print("[PerfBenchmarkSuite] Completed.");
+            _perfBenchmarkSuiteRunning = false;
+            _benchmarkAutoCameraPathActive = false;
+            if (_hasBenchmarkSuiteCameraOrigin && cameraPivot != null)
+                cameraPivot.GlobalPosition = _benchmarkSuiteCameraOrigin;
+            return;
+        }
+
+        ChunkQualityProfile profile = _perfBenchmarkSuiteIndex switch
+        {
+            0 => ChunkQualityProfile.Low,
+            1 => ChunkQualityProfile.Medium,
+            _ => ChunkQualityProfile.High
+        };
+
+        if (cameraPivot != null && !_hasBenchmarkSuiteCameraOrigin)
+        {
+            _benchmarkSuiteCameraOrigin = cameraPivot.GlobalPosition;
+            _hasBenchmarkSuiteCameraOrigin = true;
+        }
+
+        ChunkQualityProfileOverride = profile;
+        ApplyChunkQualityProfile(profile, "benchmark_suite");
+        SavePerformanceRuntimeSettings();
+        SyncPerformanceControlsFromState();
+
+        if (PerformanceBenchmarkSuiteAutoCameraPath && _hasBenchmarkSuiteCameraOrigin)
+        {
+            _benchmarkAutoCameraPathActive = true;
+            _benchmarkAutoCameraPathElapsedSec = 0.0;
+            if (cameraPivot != null)
+                cameraPivot.GlobalPosition = _benchmarkSuiteCameraOrigin;
+        }
+        else
+        {
+            _benchmarkAutoCameraPathActive = false;
+        }
+
+        StartPerformanceBenchmark($"suite_{profile.ToString().ToLowerInvariant()}");
+    }
+
+    void CancelPerformanceBenchmarkSuite()
+    {
+        bool wasRunning = _perfBenchmarkSuiteRunning;
+        _perfBenchmarkSuiteRunning = false;
+        _benchmarkAutoCameraPathActive = false;
+        if (_hasBenchmarkSuiteCameraOrigin && cameraPivot != null)
+            cameraPivot.GlobalPosition = _benchmarkSuiteCameraOrigin;
+        if (wasRunning)
+            GD.Print("[PerfBenchmarkSuite] Cancelled.");
+    }
+
+    void UpdateBenchmarkAutoCameraPath(float delta)
+    {
+        if (!_benchmarkAutoCameraPathActive || cameraPivot == null)
+            return;
+
+        _benchmarkAutoCameraPathElapsedSec += delta;
+        float t = (float)_benchmarkAutoCameraPathElapsedSec * Mathf.Max(0.05f, PerformanceBenchmarkCameraPathSpeed);
+        float x = Mathf.Cos(t) * PerformanceBenchmarkCameraPathRadiusX;
+        float z = Mathf.Sin(t * 0.87f) * PerformanceBenchmarkCameraPathRadiusZ;
+        float y = Mathf.Sin(t * 0.51f) * PerformanceBenchmarkCameraPathVerticalAmplitude;
+
+        Vector3 origin = _hasBenchmarkSuiteCameraOrigin ? _benchmarkSuiteCameraOrigin : cameraPivot.GlobalPosition;
+        cameraPivot.GlobalPosition = new Vector3(origin.X + x, origin.Y + y, origin.Z + z);
+    }
+
+    void InitPerformanceControlsUi()
+    {
+        var vbox = GetNodeOrNull<VBoxContainer>("UI/SelectionPanel/VBox");
+        if (vbox == null)
+            return;
+
+        _perfControlsBox = GetNodeOrNull<VBoxContainer>("UI/SelectionPanel/VBox/PerfControlsBox");
+        if (_perfControlsBox == null)
+        {
+            _perfControlsBox = new VBoxContainer { Name = "PerfControlsBox" };
+            vbox.AddChild(_perfControlsBox);
+        }
+
+        if (_perfProfileOption == null)
+        {
+            _perfControlsBox.AddChild(new Label { Text = "Profil perf chunks" });
+            _perfProfileOption = new OptionButton { Name = "PerfProfileOption" };
+            _perfProfileOption.AddItem("Auto", (int)ChunkQualityProfile.Auto);
+            _perfProfileOption.AddItem("Low", (int)ChunkQualityProfile.Low);
+            _perfProfileOption.AddItem("Medium", (int)ChunkQualityProfile.Medium);
+            _perfProfileOption.AddItem("High", (int)ChunkQualityProfile.High);
+            _perfProfileOption.ItemSelected += OnPerfProfileOptionSelected;
+            _perfControlsBox.AddChild(_perfProfileOption);
+        }
+
+        if (_perfAdaptiveBudgetCheck == null)
+        {
+            _perfAdaptiveBudgetCheck = new CheckBox { Name = "PerfAdaptiveBudgetCheck", Text = "Auto budget spawn chunks" };
+            _perfAdaptiveBudgetCheck.Toggled += OnPerfAdaptiveBudgetToggled;
+            _perfControlsBox.AddChild(_perfAdaptiveBudgetCheck);
+        }
+
+        if (_perfTrajectoryPrefetchCheck == null)
+        {
+            _perfTrajectoryPrefetchCheck = new CheckBox { Name = "PerfTrajectoryPrefetchCheck", Text = "Prefetch trajectoire caméra" };
+            _perfTrajectoryPrefetchCheck.Toggled += OnPerfTrajectoryPrefetchToggled;
+            _perfControlsBox.AddChild(_perfTrajectoryPrefetchCheck);
+        }
+
+        if (_perfRenderDistanceSlider == null)
+        {
+            _perfControlsBox.AddChild(new Label { Text = "Distance de rendu chunks" });
+            _perfRenderDistanceSlider = new HSlider
+            {
+                Name = "PerfRenderDistanceSlider",
+                MinValue = 60,
+                MaxValue = 300,
+                Step = 5,
+                SizeFlagsHorizontal = Control.SizeFlags.ExpandFill
+            };
+            _perfRenderDistanceSlider.ValueChanged += OnPerfRenderDistanceChanged;
+            _perfControlsBox.AddChild(_perfRenderDistanceSlider);
+            _perfRenderDistanceValueLabel = new Label { Name = "PerfRenderDistanceValueLabel" };
+            _perfControlsBox.AddChild(_perfRenderDistanceValueLabel);
+        }
+
+        if (_perfSpawnBudgetSlider == null)
+        {
+            _perfControlsBox.AddChild(new Label { Text = "Budget spawn chunks/tick refresh" });
+            _perfSpawnBudgetSlider = new HSlider
+            {
+                Name = "PerfSpawnBudgetSlider",
+                MinValue = 8,
+                MaxValue = 256,
+                Step = 4,
+                SizeFlagsHorizontal = Control.SizeFlags.ExpandFill
+            };
+            _perfSpawnBudgetSlider.ValueChanged += OnPerfSpawnBudgetChanged;
+            _perfControlsBox.AddChild(_perfSpawnBudgetSlider);
+            _perfSpawnBudgetValueLabel = new Label { Name = "PerfSpawnBudgetValueLabel" };
+            _perfControlsBox.AddChild(_perfSpawnBudgetValueLabel);
+        }
+
+        if (_perfHideGraceSlider == null)
+        {
+            _perfControlsBox.AddChild(new Label { Text = "Grace anti-pop chunks (s)" });
+            _perfHideGraceSlider = new HSlider
+            {
+                Name = "PerfHideGraceSlider",
+                MinValue = 0,
+                MaxValue = 0.8,
+                Step = 0.02,
+                SizeFlagsHorizontal = Control.SizeFlags.ExpandFill
+            };
+            _perfHideGraceSlider.ValueChanged += OnPerfHideGraceChanged;
+            _perfControlsBox.AddChild(_perfHideGraceSlider);
+            _perfHideGraceValueLabel = new Label { Name = "PerfHideGraceValueLabel" };
+            _perfControlsBox.AddChild(_perfHideGraceValueLabel);
+        }
+    }
+
+    void SyncPerformanceControlsFromState()
+    {
+        _isSyncingPerfUi = true;
+        if (_perfProfileOption != null)
+            _perfProfileOption.Select((int)ChunkQualityProfileOverride);
+        if (_perfAdaptiveBudgetCheck != null)
+            _perfAdaptiveBudgetCheck.ButtonPressed = AdaptiveChunkSpawnBudgetEnabled;
+        if (_perfTrajectoryPrefetchCheck != null)
+            _perfTrajectoryPrefetchCheck.ButtonPressed = ChunkCameraTrajectoryPrefetchEnabled;
+        if (_perfRenderDistanceSlider != null)
+            _perfRenderDistanceSlider.Value = ChunkRenderDistance;
+        if (_perfRenderDistanceValueLabel != null)
+            _perfRenderDistanceValueLabel.Text = $"{Mathf.RoundToInt(ChunkRenderDistance)}";
+        if (_perfSpawnBudgetSlider != null)
+            _perfSpawnBudgetSlider.Value = ChunkSpawnBudgetPerRefresh;
+        if (_perfSpawnBudgetValueLabel != null)
+            _perfSpawnBudgetValueLabel.Text = $"{_runtimeChunkSpawnBudget}";
+        if (_perfHideGraceSlider != null)
+            _perfHideGraceSlider.Value = ChunkHideGraceSeconds;
+        if (_perfHideGraceValueLabel != null)
+            _perfHideGraceValueLabel.Text = $"{ChunkHideGraceSeconds:0.00}";
+        _isSyncingPerfUi = false;
+    }
+
+    void OnPerfProfileOptionSelected(long index)
+    {
+        if (_isSyncingPerfUi || _perfProfileOption == null)
+            return;
+
+        var selected = (ChunkQualityProfile)_perfProfileOption.GetItemId((int)index);
+        ChunkQualityProfileOverride = selected;
+        if (selected == ChunkQualityProfile.Auto)
+        {
+            var detected = DetectChunkQualityProfile();
+            ApplyChunkQualityProfile(detected, "ui_auto");
+        }
+        else
+        {
+            ApplyChunkQualityProfile(selected, "ui_override");
+        }
+        SavePerformanceRuntimeSettings();
+        SyncPerformanceControlsFromState();
+    }
+
+    void OnPerfAdaptiveBudgetToggled(bool enabled)
+    {
+        if (_isSyncingPerfUi)
+            return;
+        AdaptiveChunkSpawnBudgetEnabled = enabled;
+        SavePerformanceRuntimeSettings();
+    }
+
+    void OnPerfTrajectoryPrefetchToggled(bool enabled)
+    {
+        if (_isSyncingPerfUi)
+            return;
+        ChunkCameraTrajectoryPrefetchEnabled = enabled;
+        SavePerformanceRuntimeSettings();
+    }
+
+    void OnPerfRenderDistanceChanged(double value)
+    {
+        if (_isSyncingPerfUi)
+            return;
+        ChunkRenderDistance = (float)value;
+        if (_perfRenderDistanceValueLabel != null)
+            _perfRenderDistanceValueLabel.Text = $"{Mathf.RoundToInt((float)value)}";
+        SavePerformanceRuntimeSettings();
+    }
+
+    void OnPerfSpawnBudgetChanged(double value)
+    {
+        if (_isSyncingPerfUi)
+            return;
+        ChunkSpawnBudgetPerRefresh = Mathf.RoundToInt((float)value);
+        if (!AdaptiveChunkSpawnBudgetEnabled)
+            _runtimeChunkSpawnBudget = ChunkSpawnBudgetPerRefresh;
+        if (_perfSpawnBudgetValueLabel != null)
+            _perfSpawnBudgetValueLabel.Text = $"{_runtimeChunkSpawnBudget}";
+        SavePerformanceRuntimeSettings();
+    }
+
+    void OnPerfHideGraceChanged(double value)
+    {
+        if (_isSyncingPerfUi)
+            return;
+        ChunkHideGraceSeconds = (float)value;
+        if (_perfHideGraceValueLabel != null)
+            _perfHideGraceValueLabel.Text = $"{ChunkHideGraceSeconds:0.00}";
+        SavePerformanceRuntimeSettings();
+    }
+
+    void LoadSavedPerformanceRuntimeSettings()
+    {
+        if (!LoadSavedChunkQualityProfile)
+            return;
+
+        string path = GetVideoSettingsPath();
+        if (!FileAccess.FileExists(path))
+            return;
+
+        var cfg = new ConfigFile();
+        if (cfg.Load(path) != Error.Ok)
+            return;
+
+        AdaptiveChunkSpawnBudgetEnabled = cfg.GetValue("video", "adaptive_chunk_spawn_budget_enabled", AdaptiveChunkSpawnBudgetEnabled).AsBool();
+        ChunkCameraTrajectoryPrefetchEnabled = cfg.GetValue("video", "chunk_camera_trajectory_prefetch_enabled", ChunkCameraTrajectoryPrefetchEnabled).AsBool();
+        ChunkRenderDistance = (float)cfg.GetValue("video", "chunk_render_distance", ChunkRenderDistance).AsDouble();
+        ChunkSpawnBudgetPerRefresh = Mathf.RoundToInt((float)cfg.GetValue("video", "chunk_spawn_budget_per_refresh", ChunkSpawnBudgetPerRefresh).AsDouble());
+        ChunkHideGraceSeconds = (float)cfg.GetValue("video", "chunk_hide_grace_seconds", ChunkHideGraceSeconds).AsDouble();
+        _runtimeChunkSpawnBudget = ChunkSpawnBudgetPerRefresh;
+    }
+
+    void SavePerformanceRuntimeSettings()
+    {
+        string path = GetVideoSettingsPath();
+        var cfg = new ConfigFile();
+        if (FileAccess.FileExists(path))
+            cfg.Load(path);
+        cfg.SetValue("video", "chunk_quality_profile", ChunkQualityProfileOverride.ToString());
+        cfg.SetValue("video", "adaptive_chunk_spawn_budget_enabled", AdaptiveChunkSpawnBudgetEnabled);
+        cfg.SetValue("video", "chunk_camera_trajectory_prefetch_enabled", ChunkCameraTrajectoryPrefetchEnabled);
+        cfg.SetValue("video", "chunk_render_distance", ChunkRenderDistance);
+        cfg.SetValue("video", "chunk_spawn_budget_per_refresh", ChunkSpawnBudgetPerRefresh);
+        cfg.SetValue("video", "chunk_hide_grace_seconds", ChunkHideGraceSeconds);
+        cfg.Save(path);
+    }
+
+    static string GetVideoSettingsPath() => "user://video_settings.cfg";
+
+    bool TryLoadSavedChunkQualityProfile(out ChunkQualityProfile profile)
+    {
+        profile = ChunkQualityProfile.Auto;
+        string path = GetVideoSettingsPath();
+        if (!FileAccess.FileExists(path))
+            return false;
+
+        var cfg = new ConfigFile();
+        var err = cfg.Load(path);
+        if (err != Error.Ok)
+            return false;
+
+        Variant value = cfg.GetValue("video", "chunk_quality_profile", "Auto");
+        string asText = value.AsString();
+        if (Enum.TryParse(asText, ignoreCase: true, out ChunkQualityProfile parsed)
+            && parsed != ChunkQualityProfile.Auto)
+        {
+            profile = parsed;
+            return true;
+        }
+
+        return false;
+    }
+
+    void SaveChunkQualityProfileSetting(ChunkQualityProfile profile)
+    {
+        if (profile == ChunkQualityProfile.Auto)
+            return;
+
+        string path = GetVideoSettingsPath();
+        var cfg = new ConfigFile();
+        if (FileAccess.FileExists(path))
+            cfg.Load(path);
+        cfg.SetValue("video", "chunk_quality_profile", profile.ToString());
+        cfg.Save(path);
     }
 
     bool IsInCameraView(Vector3I pos)
@@ -1317,17 +2221,52 @@ public partial class Game : Node3D
 
     void UpdateChunkVisibility()
     {
-        foreach (var pair in _chunkVisuals)
-            ApplyChunkFog(pair.Value, pair.Key);
+        if (_chunkVisuals.Count == 0)
+        {
+            _chunkVisibilityCursor = 0;
+            _chunkVisibilityKeysScratch.Clear();
+            _lastRenderedChunkCount = 0;
+            _lastCulledDistanceChunkCount = 0;
+            _lastCulledFrustumChunkCount = 0;
+            _lastHysteresisKeptChunkCount = 0;
+            return;
+        }
+
+        if (_chunkVisibilityCursor == 0 || _chunkVisibilityKeysScratch.Count != _chunkVisuals.Count)
+        {
+            _chunkVisibilityKeysScratch.Clear();
+            foreach (var pair in _chunkVisuals)
+                _chunkVisibilityKeysScratch.Add(pair.Key);
+
+            _lastRenderedChunkCount = 0;
+            _lastCulledDistanceChunkCount = 0;
+            _lastCulledFrustumChunkCount = 0;
+            _lastHysteresisKeptChunkCount = 0;
+        }
+
+        int batch = Mathf.Clamp(ChunkVisibilityBatchSize, 16, Math.Max(16, _chunkVisibilityKeysScratch.Count));
+        int processed = 0;
+        while (processed < batch && _chunkVisibilityCursor < _chunkVisibilityKeysScratch.Count)
+        {
+            var chunkPos = _chunkVisibilityKeysScratch[_chunkVisibilityCursor++];
+            if (_chunkVisuals.TryGetValue(chunkPos, out var cv))
+                ApplyChunkFog(cv, chunkPos);
+            processed++;
+        }
+
+        if (_chunkVisibilityCursor >= _chunkVisibilityKeysScratch.Count)
+            _chunkVisibilityCursor = 0;
     }
 
     void ApplyChunkFog(ChunkVisual cv, Vector3I chunkPos)
     {
         EvaluateChunkFog(chunkPos, out bool discovered, out bool visible);
+        bool shouldRenderRaw = ShouldRenderChunk(chunkPos);
+        bool shouldRender = ApplyChunkVisibilityHysteresis(chunkPos, shouldRenderRaw);
 
         if (cv.Solid != null)
         {
-            if (!discovered)
+            if (!discovered || !shouldRender)
                 cv.Solid.Visible = false;
             else
             {
@@ -1356,7 +2295,98 @@ public partial class Game : Node3D
         }
 
         foreach (var r in cv.Resources)
-            r.Visible = discovered;
+            r.Visible = discovered && shouldRender;
+
+        if (discovered && shouldRender)
+            _lastRenderedChunkCount++;
+    }
+
+    bool ApplyChunkVisibilityHysteresis(Vector3I chunkPos, bool shouldRenderRaw)
+    {
+        if (!ChunkVisibilityHysteresisEnabled)
+        {
+            if (!shouldRenderRaw)
+                _chunkHideGraceUntilByPos.Remove(chunkPos);
+            return shouldRenderRaw;
+        }
+
+        double now = Time.GetTicksMsec() * 0.001;
+        double grace = Mathf.Max(0.0f, ChunkHideGraceSeconds);
+        if (shouldRenderRaw)
+        {
+            _chunkHideGraceUntilByPos[chunkPos] = now + grace;
+            return true;
+        }
+
+        if (_chunkHideGraceUntilByPos.TryGetValue(chunkPos, out double until) && now <= until)
+        {
+            _lastHysteresisKeptChunkCount++;
+            return true;
+        }
+
+        _chunkHideGraceUntilByPos.Remove(chunkPos);
+        return false;
+    }
+
+    bool ShouldRenderChunk(Vector3I chunkPos)
+    {
+        if (camera == null)
+            return true;
+
+        Vector3 center = GetChunkCenterWorld(chunkPos);
+
+        if (ChunkDistanceCullingEnabled && ChunkRenderDistance > 0.1f)
+        {
+            float maxDistSq = ChunkRenderDistance * ChunkRenderDistance;
+            if (camera.GlobalPosition.DistanceSquaredTo(center) > maxDistSq)
+            {
+                _lastCulledDistanceChunkCount++;
+                return false;
+            }
+        }
+
+        if (ChunkFrustumCullingEnabled && !IsChunkInCameraFrustum(chunkPos, ChunkFrustumPadding))
+        {
+            _lastCulledFrustumChunkCount++;
+            return false;
+        }
+
+        return true;
+    }
+
+    Vector3 GetChunkCenterWorld(Vector3I chunkPos)
+    {
+        float half = Map.CHUNK_SIZE * 0.5f;
+        return new Vector3(
+            chunkPos.X * Map.CHUNK_SIZE + half,
+            chunkPos.Y * Map.CHUNK_SIZE + half,
+            chunkPos.Z * Map.CHUNK_SIZE + half);
+    }
+
+    bool IsChunkInCameraFrustum(Vector3I chunkPos, float padding)
+    {
+        if (camera == null)
+            return true;
+
+        float minX = chunkPos.X * Map.CHUNK_SIZE - padding;
+        float minY = chunkPos.Y * Map.CHUNK_SIZE - padding;
+        float minZ = chunkPos.Z * Map.CHUNK_SIZE - padding;
+        float maxX = (chunkPos.X + 1) * Map.CHUNK_SIZE + padding;
+        float maxY = (chunkPos.Y + 1) * Map.CHUNK_SIZE + padding;
+        float maxZ = (chunkPos.Z + 1) * Map.CHUNK_SIZE + padding;
+
+        // Test corners + center to reduce false negatives at frustum edges.
+        if (camera.IsPositionInFrustum(new Vector3(minX, minY, minZ))) return true;
+        if (camera.IsPositionInFrustum(new Vector3(minX, minY, maxZ))) return true;
+        if (camera.IsPositionInFrustum(new Vector3(minX, maxY, minZ))) return true;
+        if (camera.IsPositionInFrustum(new Vector3(minX, maxY, maxZ))) return true;
+        if (camera.IsPositionInFrustum(new Vector3(maxX, minY, minZ))) return true;
+        if (camera.IsPositionInFrustum(new Vector3(maxX, minY, maxZ))) return true;
+        if (camera.IsPositionInFrustum(new Vector3(maxX, maxY, minZ))) return true;
+        if (camera.IsPositionInFrustum(new Vector3(maxX, maxY, maxZ))) return true;
+        if (camera.IsPositionInFrustum(GetChunkCenterWorld(chunkPos))) return true;
+
+        return false;
     }
 
     void EvaluateChunkFog(Vector3I chunkPos, out bool discovered, out bool visible)
@@ -1446,6 +2476,7 @@ public partial class Game : Node3D
             UnregisterTreeRoots(cv);
             cv.FreeVisual();
             _chunkVisuals.Remove(chunkPos);
+            _chunkHideGraceUntilByPos.Remove(chunkPos);
             var chunk = sim.World.CurrentMap.GetOrCreateChunk(chunkPos);
             SpawnChunkMesh(chunkPos, chunk);
             if (_verticalSliceTerrainActive)
