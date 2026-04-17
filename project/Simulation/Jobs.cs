@@ -43,7 +43,7 @@ public class SimJob
     public int EnqueueOrder;
     /// <summary>Type final pour les jobs de construction voxel.</summary>
     public string BuildTileType = "stone";
-    /// <summary>0 = hors chantier ; sinon id de BuildSite.</summary>
+    /// <summary>Legacy field kept for save compatibility; always 0 in new build flow.</summary>
     public int BuildSiteId;
     public string ResourceType = string.Empty;
     public int ResourceAmount;
@@ -177,7 +177,14 @@ public class JobBoard
         }
     }
 
-    public bool TryReserveBest(int colonistId, Vector3I colonPos, int currentTick, HashSet<int> excludedJobIds, Func<SimJob, bool> canOfferJob, out SimJob job)
+    public bool TryReserveBest(
+        int colonistId,
+        Vector3I colonPos,
+        int currentTick,
+        HashSet<int> excludedJobIds,
+        Func<SimJob, bool> canOfferJob,
+        Func<SimJob, int> scoreBonus,
+        out SimJob job)
     {
         job = null;
         int bestScore = int.MinValue;
@@ -205,6 +212,8 @@ public class JobBoard
                 JobType.BuildBlock or JobType.MineStone => (int)j.Priority * 1_000_000 - j.EnqueueOrder * 10 - distance,
                 _ => (int)j.Priority * 1_000_000 - distance * 1000 - j.EnqueueOrder
             };
+            if (scoreBonus != null)
+                score += scoreBonus(j);
             if (score <= bestScore)
                 continue;
 

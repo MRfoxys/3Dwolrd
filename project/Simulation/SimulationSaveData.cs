@@ -24,6 +24,8 @@ public sealed class ColonistSaveData
     public int OwnerId;
     public Int3SaveData Position = new();
     public Int3SaveData Target = new();
+    public float Hunger = 100f;
+    public float Rest = 100f;
 }
 
 public sealed class TileSaveData
@@ -75,4 +77,5 @@ public sealed class SimulationSaveData
     public List<ResourceSaveData> LooseResources = new();
     public Dictionary<string, int> StockpileInventory = new();
     public List<Int3SaveData> StockpileCells = new();
+    public List<Int3SaveData> RecoveryCells = new();
 }

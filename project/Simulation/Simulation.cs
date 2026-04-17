@@ -20,6 +20,22 @@ public partial class Simulation :GodotObject
 
     /// <summary>Rayon de vision en tuiles (sphère monde, pas au pas des chunks).</summary>
     public int VisionRadiusTiles = 12;
+    public int DesignationPlanningIntervalTicks = 3;
+    public int MaxNewBuildJobsPerPlan = 16;
+    public int MaxScaffoldGenerationsPerTick = 2;
+    public int BuildWorkSearchMaxShell = 6;
+    public int JobAssignAttemptsPerColonTick = 6;
+    public int BuildScaffoldMinFailuresBeforeGenerate = 2;
+    public int BuildScaffoldRetryFailureStride = 2;
+    public int WaitingAccessWakeIntervalTicks = 3;
+    public float ColonNeedHungerDecayPerTick = 0.010f;
+    public float ColonNeedRestDecayMovePerTick = 0.020f;
+    public float ColonNeedRestDecayWorkPerTick = 0.030f;
+    public float ColonNeedRestRecoveryIdlePerTick = 0.060f;
+    public float ColonNeedRestRecoveryAtRecoveryCellPerTick = 0.095f;
+    public float ColonNeedHungerRecoveryAtRecoveryCellPerTick = 0.075f;
+    public float ColonNeedCriticalThreshold = 10f;
+    public float ColonNeedLowThreshold = 35f;
 
     Pathfinder pathfinder;
     readonly PathRequestService pathRequestService = new PathRequestService();
@@ -43,15 +59,18 @@ public partial class Simulation :GodotObject
     readonly Dictionary<Vector3I, int> scaffoldRetryAfterTickByTarget = new();
     readonly List<SimJob> _jobScratch = new();
     readonly List<WorkDesignation> _designationScratch = new();
+    readonly List<Vector3I> _buildActiveTargetsScratch = new();
+    readonly HashSet<Vector3I> _buildFrontierPendingScratch = new();
+    readonly Dictionary<int, int> _jobAccessFailuresByJobId = new();
     readonly List<Vector3I> _minePlanSortBuffer = new();
-    readonly HashSet<Vector3I> _designationPendingSetScratch = new();
-    readonly Queue<Vector3I> _designationBfsQueue = new();
-    readonly Dictionary<int, BuildSite> _buildSites = new();
-    int _nextBuildSiteId = 1;
+    readonly List<Vector3I> _buildPlanSortBuffer = new();
     readonly Dictionary<Vector3I, LooseResourceStack> _looseResources = new();
     readonly Dictionary<string, int> _stockpileInventory = new(StringComparer.Ordinal);
     readonly HashSet<Vector3I> _stockpileCells = new();
+    readonly HashSet<Vector3I> _recoveryCells = new();
     readonly List<Vector3I> _haulScratch = new();
+    int _scaffoldGenerationTick = -1;
+    int _scaffoldGeneratedThisTick = 0;
     bool pendingWalkabilityRefresh;
     Vector3I? walkabilityChangeFocus;
     bool walkabilityChangeFullRepath;
@@ -60,6 +79,12 @@ public partial class Simulation :GodotObject
     public IReadOnlyDictionary<Vector3I, LooseResourceStack> LooseResources => _looseResources;
     public IReadOnlyDictionary<string, int> StockpileInventory => _stockpileInventory;
     public IReadOnlyCollection<Vector3I> StockpileCells => _stockpileCells;
+    public IReadOnlyCollection<Vector3I> RecoveryCells => _recoveryCells;
+
+    public bool IsWalkableCell(Vector3I cell)
+    {
+        return pathfinder != null && pathfinder.IsWalkable(cell);
+    }
 
     public void Init()
     {
@@ -69,9 +94,11 @@ public partial class Simulation :GodotObject
         designationBoard.Clear();
         reservationManager.Reset();
         scaffoldRetryAfterTickByTarget.Clear();
+        _jobAccessFailuresByJobId.Clear();
         _looseResources.Clear();
         _stockpileInventory.Clear();
         _stockpileCells.Clear();
+        _recoveryCells.Clear();
         jobBoard = new JobBoard();
         pathfinder = new Pathfinder(
             (pos) => map.GetTile(pos),
@@ -82,6 +109,7 @@ public partial class Simulation :GodotObject
         foreach (var giver in workGivers)
             giver.Bootstrap(map, jobBoard);
         InitDefaultStockpileCells();
+        InitDefaultRecoveryCells();
     }
 
     public void DesignateBuildCells(IEnumerable<Vector3I> cells, string buildTileType, JobPriority priority = JobPriority.Normal)
@@ -144,72 +172,6 @@ public partial class Simulation :GodotObject
         });
     }
 
-    /// <summary>Crée un chantier (≥2 blocs) : ralliement, déblocage par support, jobs liés.</summary>
-    public void RegisterBuildSiteAndEnqueueJobs(List<Vector3I> sortedCells, string buildTileType)
-    {
-        var map = World.CurrentMap;
-        if (sortedCells == null || sortedCells.Count < 2)
-            return;
-
-        var queued = new List<Vector3I>();
-        foreach (var cell in sortedCells)
-        {
-            if (jobBoard.HasActiveJobOnTarget(cell, JobType.BuildBlock))
-                continue;
-            var t = map.GetTile(cell);
-            if (t != null && t.Solid)
-                continue;
-            queued.Add(cell);
-        }
-
-        if (queued.Count < 2)
-        {
-            foreach (var c in queued)
-            {
-                jobBoard.AddJob(new SimJob
-                {
-                    Type = JobType.BuildBlock,
-                    Priority = JobPriority.Normal,
-                    Target = c,
-                    BuildTileType = string.IsNullOrEmpty(buildTileType) ? "stone" : buildTileType
-                });
-            }
-            return;
-        }
-
-        int minY = int.MaxValue;
-        var footprint = new HashSet<Vector3I>();
-        foreach (var c in queued)
-        {
-            footprint.Add(c);
-            minY = Mathf.Min(minY, c.Y);
-        }
-
-        if (!TryPickRallyForFootprint(footprint, minY, out var rally))
-            rally = FindRallyFallback(footprint, minY);
-
-        // Ordre "colonne + escalier" centré sur le rally.
-        VoxelSelectionOrder.SortForBuildEnqueue(queued, rally);
-
-        int id = _nextBuildSiteId++;
-        var site = new BuildSite(id, rally, minY, queued);
-        _buildSites[id] = site;
-
-        foreach (var cell in queued)
-        {
-            jobBoard.AddJob(new SimJob
-            {
-                Type = JobType.BuildBlock,
-                Priority = JobPriority.Normal,
-                Target = cell,
-                BuildTileType = string.IsNullOrEmpty(buildTileType) ? "stone" : buildTileType,
-                BuildSiteId = id
-            });
-        }
-
-        GD.Print($"[BuildSite] Chantier #{id} : {queued.Count} bloc(s), rally @ {rally}");
-    }
-
     void InitDefaultStockpileCells()
     {
         var map = World?.CurrentMap;
@@ -224,6 +186,92 @@ public partial class Simulation :GodotObject
             if (pathfinder.IsWalkable(c))
                 _stockpileCells.Add(c);
         }
+    }
+
+    void InitDefaultRecoveryCells()
+    {
+        var map = World?.CurrentMap;
+        if (map == null)
+            return;
+
+        var center = new Vector3I(-1, Map.ColonistWalkY, -1);
+        for (int x = 0; x <= 1; x++)
+        for (int z = 0; z <= 1; z++)
+        {
+            var c = new Vector3I(center.X + x, center.Y, center.Z + z);
+            if (pathfinder.IsWalkable(c))
+                _recoveryCells.Add(c);
+        }
+    }
+
+    public int SetStockpileCells(IEnumerable<Vector3I> cells, bool replace)
+    {
+        if (cells == null)
+            return 0;
+        if (replace)
+            _stockpileCells.Clear();
+        int added = 0;
+        foreach (var c in cells)
+        {
+            if (!pathfinder.IsWalkable(c))
+                continue;
+            if (_stockpileCells.Add(c))
+                added++;
+        }
+        return added;
+    }
+
+    public void ClearStockpileCells()
+    {
+        _stockpileCells.Clear();
+    }
+
+    public int RemoveStockpileCells(IEnumerable<Vector3I> cells)
+    {
+        if (cells == null)
+            return 0;
+        int removed = 0;
+        foreach (var c in cells)
+        {
+            if (_stockpileCells.Remove(c))
+                removed++;
+        }
+        return removed;
+    }
+
+    public int SetRecoveryCells(IEnumerable<Vector3I> cells, bool replace)
+    {
+        if (cells == null)
+            return 0;
+        if (replace)
+            _recoveryCells.Clear();
+        int added = 0;
+        foreach (var c in cells)
+        {
+            if (!pathfinder.IsWalkable(c))
+                continue;
+            if (_recoveryCells.Add(c))
+                added++;
+        }
+        return added;
+    }
+
+    public void ClearRecoveryCells()
+    {
+        _recoveryCells.Clear();
+    }
+
+    public int RemoveRecoveryCells(IEnumerable<Vector3I> cells)
+    {
+        if (cells == null)
+            return 0;
+        int removed = 0;
+        foreach (var c in cells)
+        {
+            if (_recoveryCells.Remove(c))
+                removed++;
+        }
+        return removed;
     }
 
     void AddLooseResource(Vector3I worldCell, string resourceType, int amount)
@@ -258,14 +306,14 @@ public partial class Simulation :GodotObject
 
     void PlanBuildDesignations()
     {
-        const int maxNewJobsPerTick = 24;
+        int maxNewJobsPerTick = Mathf.Max(4, MaxNewBuildJobsPerPlan);
         designationBoard.CopyByType(DesignationType.Build, _designationScratch, onlyUnplanned: true);
         if (_designationScratch.Count == 0)
             return;
 
         var map = World.CurrentMap;
-        var buildByCell = new Dictionary<Vector3I, WorkDesignation>();
-        _designationPendingSetScratch.Clear();
+        var buildByCell = new Dictionary<Vector3I, WorkDesignation>(_designationScratch.Count);
+        _buildPlanSortBuffer.Clear();
         foreach (var d in _designationScratch)
         {
             var t = map.GetTile(d.Target);
@@ -286,56 +334,49 @@ public partial class Simulation :GodotObject
             }
 
             buildByCell[d.Target] = d;
-            _designationPendingSetScratch.Add(d.Target);
+            _buildPlanSortBuffer.Add(d.Target);
         }
 
-        int plannedCount = 0;
-        while (_designationPendingSetScratch.Count > 0 && plannedCount < maxNewJobsPerTick)
+        if (_buildPlanSortBuffer.Count == 0)
+            return;
+
+        Vector3I anchor = _buildPlanSortBuffer[0];
+        foreach (var colon in World.CurrentMap.Colonists)
         {
-            Vector3I seed = default;
-            foreach (var c in _designationPendingSetScratch)
-            {
-                seed = c;
-                break;
-            }
-
-            var cluster = CollectBuildCluster(seed, _designationPendingSetScratch);
-            if (cluster.Count == 0)
-                break;
-
-            string tileType = buildByCell.TryGetValue(seed, out var sd) ? sd.BuildTileType : "stone";
-            if (cluster.Count >= 2)
-            {
-                RegisterBuildSiteAndEnqueueJobs(cluster, tileType);
-                foreach (var c in cluster)
-                {
-                    if (jobBoard.HasActiveJobOnTarget(c, JobType.BuildBlock))
-                    {
-                        designationBoard.MarkPlanned(DesignationType.Build, c);
-                        plannedCount++;
-                    }
-                }
+            if (colon.OwnerId != 0)
                 continue;
-            }
+            anchor = colon.Position;
+            break;
+        }
 
-            var single = cluster[0];
-            if (jobBoard.HasActiveJobOnTarget(single, JobType.BuildBlock))
+        // Planner build "frontière" : support d'abord, puis proximité du groupe, ordre déterministe.
+        ConstructionPlanner.SortBuildCellsForPlanning(
+            _buildPlanSortBuffer,
+            anchor,
+            (p) =>
             {
-                designationBoard.MarkPlanned(DesignationType.Build, single);
-                continue;
-            }
+                var t = map.GetTile(p);
+                return t != null && t.Solid;
+            },
+            (p) => pathfinder.IsWalkable(p)
+        );
 
-            if (!buildByCell.TryGetValue(single, out var dsg))
+        int plannedCount = 0;
+        foreach (var c in _buildPlanSortBuffer)
+        {
+            if (plannedCount >= maxNewJobsPerTick)
+                break;
+            if (!buildByCell.TryGetValue(c, out var dsg))
                 continue;
 
             jobBoard.AddJob(new SimJob
             {
                 Type = JobType.BuildBlock,
                 Priority = dsg.Priority,
-                Target = single,
+                Target = c,
                 BuildTileType = dsg.BuildTileType
             });
-            designationBoard.MarkPlanned(DesignationType.Build, single);
+            designationBoard.MarkPlanned(DesignationType.Build, c);
             plannedCount++;
         }
     }
@@ -478,148 +519,16 @@ public partial class Simulation :GodotObject
         return found ? best : null;
     }
 
-    List<Vector3I> CollectBuildCluster(Vector3I seed, HashSet<Vector3I> pending)
-    {
-        var cluster = new List<Vector3I>();
-        if (!pending.Remove(seed))
-            return cluster;
-
-        _designationBfsQueue.Clear();
-        _designationBfsQueue.Enqueue(seed);
-        cluster.Add(seed);
-
-        ReadOnlySpan<Vector3I> neighbors = stackalloc Vector3I[]
-        {
-            new(1,0,0), new(-1,0,0), new(0,0,1), new(0,0,-1), new(0,1,0), new(0,-1,0),
-        };
-
-        const int maxClusterSize = 48;
-        while (_designationBfsQueue.Count > 0 && cluster.Count < maxClusterSize)
-        {
-            var c = _designationBfsQueue.Dequeue();
-            foreach (var d in neighbors)
-            {
-                var n = c + d;
-                if (!pending.Remove(n))
-                    continue;
-                cluster.Add(n);
-                _designationBfsQueue.Enqueue(n);
-                if (cluster.Count >= maxClusterSize)
-                    break;
-            }
-        }
-
-        return cluster;
-    }
-
-    bool TryPickRallyForFootprint(HashSet<Vector3I> footprint, int minY, out Vector3I rally)
-    {
-        rally = default;
-        ReadOnlySpan<Vector3I> offs = stackalloc Vector3I[]
-        {
-            new(1, 0, 0), new(-1, 0, 0), new(0, 0, 1), new(0, 0, -1),
-            new(1, 0, 1), new(1, 0, -1), new(-1, 0, 1), new(-1, 0, -1),
-        };
-
-        Vector3I colonAvg = Vector3I.Zero;
-        int nc = 0;
-        foreach (var c in World.CurrentMap.Colonists)
-        {
-            if (c.OwnerId != 0)
-                continue;
-            colonAvg += c.Position;
-            nc++;
-        }
-
-        if (nc > 0)
-            colonAvg = new Vector3I(colonAvg.X / nc, colonAvg.Y / nc, colonAvg.Z / nc);
-
-        int best = int.MaxValue;
-        bool any = false;
-        foreach (var b in footprint)
-        {
-            if (b.Y != minY)
-                continue;
-            foreach (var d in offs)
-            {
-                var n = b + d;
-                if (footprint.Contains(n))
-                    continue;
-                if (!pathfinder.IsWalkable(n))
-                    continue;
-                if (IsOccupied(n))
-                    continue;
-
-                int dist = Mathf.Abs(n.X - colonAvg.X) + Mathf.Abs(n.Y - colonAvg.Y) + Mathf.Abs(n.Z - colonAvg.Z);
-                if (dist >= best)
-                    continue;
-                best = dist;
-                rally = n;
-                any = true;
-            }
-        }
-
-        return any;
-    }
-
-    Vector3I FindRallyFallback(HashSet<Vector3I> footprint, int minY)
-    {
-        int sx = 0, sz = 0, n = 0;
-        foreach (var p in footprint)
-        {
-            if (p.Y != minY)
-                continue;
-            sx += p.X;
-            sz += p.Z;
-            n++;
-        }
-
-        Vector3I anchor;
-        if (n > 0)
-            anchor = new Vector3I(sx / n, minY, sz / n);
-        else
-        {
-            anchor = default;
-            foreach (var p in footprint)
-            {
-                anchor = p;
-                break;
-            }
-        }
-
-        for (int y = minY; y <= minY + 2; y++)
-        {
-            for (int r = 0; r < 18; r++)
-            {
-                for (int dx = -r; dx <= r; dx++)
-                for (int dy = -r; dy <= r; dy++)
-                for (int dz = -r; dz <= r; dz++)
-                {
-                    if (!OnChebyshevShell(dx, dy, dz, r))
-                        continue;
-                    var pos = anchor + new Vector3I(dx, dy, dz);
-                    if (footprint.Contains(pos))
-                        continue;
-                    if (!pathfinder.IsWalkable(pos))
-                        continue;
-                    if (IsOccupied(pos))
-                        continue;
-                    return pos;
-                }
-            }
-        }
-
-        return anchor;
-    }
-
     public void Update()
     {
         Tick++;
 
         ProcessCommandQueue();
-        if (Tick % 3 == 0)
+        int planningInterval = Mathf.Max(1, DesignationPlanningIntervalTicks);
+        if (Tick % planningInterval == 0)
             PlanDesignationsIntoJobs();
-        if (Tick % 8 == 0)
+        int waitingWakeInterval = Mathf.Max(1, WaitingAccessWakeIntervalTicks);
+        if (Tick % waitingWakeInterval == 0)
             jobBoard.WakeWaitingAccessJobsDue(Tick);
         if (Tick % 12 == 0)
             CleanupVirtualScaffoldsIfBuildQueueEmpty();
@@ -635,7 +544,9 @@ public partial class Simulation :GodotObject
 
             ApplyColonistGravity(colon);
             UpdateVision(colon);
+            UpdateColonNeeds(colon);
             UpdateColon(colon);
+            UpdateColonActivity(colon);
             if (Tick % 12 == 0)
                 TryRecoverIdlePerchedColonist(colon);
         }
@@ -687,6 +598,7 @@ public partial class Simulation :GodotObject
             HashSet<Vector3I> reserved = new();
             var colon = World.CurrentMap.Colonists[cmd.EntityId];
             CancelColonCurrentJobForManualMove(colon);
+            colon.NeedsRecoveryCell = null;
             colon.HasPathFailed = false;
             colon.RepathTimer = 0;
             colon.WaitTimer = 0;
@@ -963,6 +875,9 @@ public partial class Simulation :GodotObject
                     return;
             }
 
+            if (TryStartNeedsRecoveryPath(colon))
+                return;
+
             TryAssignJob(colon);
         }
 
@@ -1035,43 +950,41 @@ public partial class Simulation :GodotObject
 
     void TryAssignJob(Colonist colon)
     {
+        if (colon == null)
+            return;
+        if (ShouldPauseForNeedsRecovery(colon))
+            return;
+
         int colonistId = GetColonistIndex(colon);
         if (colonistId < 0)
             return;
         HashSet<int> rejectedJobIds = new();
-        const int maxAttempts = 8;
+        int maxAttempts = Mathf.Max(2, JobAssignAttemptsPerColonTick);
 
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
-            if (!jobBoard.TryReserveBest(colonistId, colon.Position, Tick, rejectedJobIds, CanOfferBuildJob, out var job))
+            if (!jobBoard.TryReserveBest(
+                colonistId,
+                colon.Position,
+                Tick,
+                rejectedJobIds,
+                j => CanOfferJobForColon(colon, j),
+                j => GetColonJobScoreBonus(colon, j),
+                out var job))
                 return;
-
-            if (job.Type == JobType.BuildBlock && job.BuildSiteId != 0
-                && _buildSites.TryGetValue(job.BuildSiteId, out var siteForRoofAssign)
-                && siteForRoofAssign.RoofTargets.Count > 0
-                && siteForRoofAssign.RoofTargets.Contains(job.Target))
-            {
-                var r = siteForRoofAssign.RallyCell;
-                int rcx = Mathf.Abs(colon.Position.X - r.X);
-                int rcy = Mathf.Abs(colon.Position.Y - r.Y);
-                int rcz = Mathf.Abs(colon.Position.Z - r.Z);
-                if (Mathf.Max(rcx, Mathf.Max(rcy, rcz)) > 1)
-                {
-                    // Amène le colon au point de ralliement pour pouvoir prendre
-                    // ensuite les jobs "sommet de colonne" sans bloquer le chantier.
-                    colon.PostBuildRallyCell = r;
-                    rejectedJobIds.Add(job.Id);
-                    jobBoard.ReleaseJobWaitingForAccess(job, Tick, retryDelayTicks: 4);
-                    continue;
-                }
-            }
 
             var workPos = job.Type switch
             {
                 JobType.CutTree => FindNearestWalkableAdjacentToBlock(job.Target, forbidSameXzColumn: true, preferDiagonalXz: true, avoidAboveTarget: false, buildContextJob: null),
                 JobType.MineStone => FindNearestWalkableAdjacentToBlock(job.Target, forbidSameXzColumn: true, preferDiagonalXz: true, avoidAboveTarget: true, buildContextJob: null),
-                JobType.BuildBlock => FindNearestWalkableAdjacentToBlock(job.Target, forbidSameXzColumn: true, preferDiagonalXz: true, avoidAboveTarget: true, buildContextJob: job),
-                JobType.HaulResource => FindNearestFree(job.Target),
+                JobType.BuildBlock => FindNearestWalkableAdjacentToBlock(
+                    job.Target,
+                    forbidSameXzColumn: true,
+                    preferDiagonalXz: true,
+                    avoidAboveTarget: true,
+                    buildContextJob: job,
+                    maxShellRadius: Mathf.Max(2, BuildWorkSearchMaxShell)),
+                JobType.HaulResource => job.ResourceAmount < 0 ? FindNearestFree(job.DropoffTarget) : FindNearestFree(job.Target),
                 _ => FindNearestFree(job.Target)
             };
 
@@ -1079,7 +992,7 @@ public partial class Simulation :GodotObject
             {
                 TryQueueAccessScaffoldForBlockedPath(colon, job, workPos);
                 rejectedJobIds.Add(job.Id);
-                jobBoard.ReleaseJobWaitingForAccess(job, Tick, retryDelayTicks: 12);
+                MarkJobWaitingAccessWithBackoff(job, baseRetryDelayTicks: 12);
                 continue;
             }
 
@@ -1087,7 +1000,7 @@ public partial class Simulation :GodotObject
             {
                 TryQueueAccessScaffoldForBlockedPath(colon, job, workPos);
                 rejectedJobIds.Add(job.Id);
-                jobBoard.ReleaseJobWaitingForAccess(job, Tick, retryDelayTicks: 8);
+                MarkJobWaitingAccessWithBackoff(job, baseRetryDelayTicks: 8);
                 continue;
             }
 
@@ -1102,7 +1015,7 @@ public partial class Simulation :GodotObject
             {
                 TryQueueAccessScaffoldForBlockedPath(colon, job, workPos);
                 rejectedJobIds.Add(job.Id);
-                jobBoard.ReleaseJobWaitingForAccess(job, Tick, retryDelayTicks: 8);
+                MarkJobWaitingAccessWithBackoff(job, baseRetryDelayTicks: 8);
                 continue;
             }
 
@@ -1112,7 +1025,7 @@ public partial class Simulation :GodotObject
             {
                 TryQueueAccessScaffoldForBlockedPath(colon, job, workPos);
                 rejectedJobIds.Add(job.Id);
-                jobBoard.ReleaseJobWaitingForAccess(job, Tick, retryDelayTicks: 8);
+                MarkJobWaitingAccessWithBackoff(job, baseRetryDelayTicks: 8);
                 continue;
             }
 
@@ -1121,7 +1034,7 @@ public partial class Simulation :GodotObject
             {
                 TryQueueAccessScaffoldForBlockedPath(colon, job, workPos);
                 rejectedJobIds.Add(job.Id);
-                jobBoard.ReleaseJobWaitingForAccess(job, Tick, retryDelayTicks: 8);
+                MarkJobWaitingAccessWithBackoff(job, baseRetryDelayTicks: 8);
                 continue;
             }
 
@@ -1135,23 +1048,58 @@ public partial class Simulation :GodotObject
                 continue;
             }
             colon.ActiveJob = job;
+            colon.NeedsRecoveryCell = null;
             colon.Path = path;
             colon.Target = workPos;
             colon.MoveProgress = 0f;
             colon.WorkTicksRemaining = 0;
-            if (job.BuildSiteId != 0 && _buildSites.TryGetValue(job.BuildSiteId, out var siteCommitted))
-                siteCommitted.WorkersCommitted.Add(colonistId);
+            _jobAccessFailuresByJobId.Remove(job.Id);
             return;
         }
     }
 
-    bool CanOfferBuildJob(SimJob j)
+    bool CanOfferJobForColon(Colonist colon, SimJob j)
     {
-        if (j.Type != JobType.BuildBlock || j.BuildSiteId == 0)
-            return true;
-        if (!_buildSites.TryGetValue(j.BuildSiteId, out var site))
-            return true;
-        return site.IsJobUnlocked(j, World.CurrentMap, World.CurrentMap.Colonists);
+        if (colon == null || j == null)
+            return false;
+        if (GetColonJobPriority(colon, j.Type) <= 0)
+            return false;
+        return true;
+    }
+
+    int GetColonJobScoreBonus(Colonist colon, SimJob job)
+    {
+        int p = GetColonJobPriority(colon, job?.Type ?? JobType.CutTree);
+        // Enough impact to matter, but still below base priority tier.
+        int bonus = p * 25_000;
+        if (colon == null || job == null)
+            return bonus;
+
+        if (colon.Rest < ColonNeedCriticalThreshold)
+            bonus -= 90_000;
+        else if (colon.Rest < ColonNeedLowThreshold)
+            bonus -= 35_000;
+
+        if (colon.Hunger < ColonNeedCriticalThreshold)
+            bonus -= 60_000;
+        else if (colon.Hunger < ColonNeedLowThreshold)
+            bonus -= 25_000;
+
+        return bonus;
+    }
+
+    static int GetColonJobPriority(Colonist colon, JobType type)
+    {
+        if (colon == null)
+            return 0;
+        return type switch
+        {
+            JobType.CutTree => colon.PriorityCutTree,
+            JobType.MineStone => colon.PriorityMineStone,
+            JobType.BuildBlock => colon.PriorityBuildBlock,
+            JobType.HaulResource => colon.PriorityHaulResource,
+            _ => 1
+        };
     }
 
     bool CanUseAutoScaffoldForJob(SimJob job)
@@ -1165,9 +1113,11 @@ public partial class Simulation :GodotObject
     {
         if (!CanUseAutoScaffoldForJob(blockedJob))
             return false;
-        if (scaffoldRetryAfterTickByTarget.TryGetValue(blockedJob.Target, out int retryAfter) && Tick < retryAfter)
+        if (!ShouldAttemptAutoScaffoldNow(blockedJob))
             return false;
-        if (blockedJob.Type == JobType.BuildBlock && virtualScaffolds.IsBuildSiteSeeded(blockedJob.BuildSiteId))
+        if (!CanGenerateScaffoldThisTick())
+            return false;
+        if (scaffoldRetryAfterTickByTarget.TryGetValue(blockedJob.Target, out int retryAfter) && Tick < retryAfter)
             return false;
         if (virtualScaffolds.IsTargetSeeded(blockedJob.Target))
             return false;
@@ -1186,16 +1136,14 @@ public partial class Simulation :GodotObject
             generated = virtualScaffolds.TryGenerateColumn(
                 World.CurrentMap,
                 jobBoard,
-                _buildSites,
                 blockedJob.Target,
-                blockedJob.BuildSiteId,
                 (probeFrom) =>
                 {
                     if (colon == null)
                         return true;
                     if (!pathfinder.IsWalkable(probeFrom))
                         return false;
-                    var p = pathfinder.FindPath(colon.Position, blockedWorkPos);
+                    var p = pathfinder.FindPath(probeFrom, blockedWorkPos);
                     return p != null && p.Count > 1;
                 },
                 out generatedCount);
@@ -1216,13 +1164,59 @@ public partial class Simulation :GodotObject
             return false;
         }
 
+        RegisterScaffoldGenerationThisTick();
+
         virtualScaffolds.MarkTargetSeeded(blockedJob.Target);
         scaffoldRetryAfterTickByTarget.Remove(blockedJob.Target);
-        if (blockedJob.Type == JobType.BuildBlock)
-            virtualScaffolds.MarkBuildSiteSeeded(blockedJob.BuildSiteId);
         RequestWalkabilityRefresh(colon?.Position ?? blockedJob.Target);
         LogDebug($"[Scaffold] {generatedCount} cellule(s) générée(s) pour accès job @ {blockedJob.Target}");
         return true;
+    }
+
+    bool ShouldAttemptAutoScaffoldNow(SimJob job)
+    {
+        if (job == null)
+            return false;
+        if (job.Type != JobType.BuildBlock)
+            return true;
+
+        int projectedFailures = GetJobAccessFailureCount(job.Id) + 1;
+        int minFailures = Mathf.Max(1, BuildScaffoldMinFailuresBeforeGenerate);
+        if (projectedFailures < minFailures)
+            return false;
+
+        int stride = Mathf.Max(1, BuildScaffoldRetryFailureStride);
+        return (projectedFailures - minFailures) % stride == 0;
+    }
+
+    int GetJobAccessFailureCount(int jobId)
+    {
+        if (!_jobAccessFailuresByJobId.TryGetValue(jobId, out int failures))
+            return 0;
+        return failures;
+    }
+
+    bool CanGenerateScaffoldThisTick()
+    {
+        int maxPerTick = Mathf.Max(1, MaxScaffoldGenerationsPerTick);
+        if (_scaffoldGenerationTick != Tick)
+        {
+            _scaffoldGenerationTick = Tick;
+            _scaffoldGeneratedThisTick = 0;
+        }
+
+        return _scaffoldGeneratedThisTick < maxPerTick;
+    }
+
+    void RegisterScaffoldGenerationThisTick()
+    {
+        if (_scaffoldGenerationTick != Tick)
+        {
+            _scaffoldGenerationTick = Tick;
+            _scaffoldGeneratedThisTick = 0;
+        }
+
+        _scaffoldGeneratedThisTick++;
     }
 
     bool TryQueueColonStairScaffold(Colonist colon, Vector3I blockedWorkPos, out int generatedCount)
@@ -1380,6 +1374,79 @@ public partial class Simulation :GodotObject
         colon.HasPathFailed = false;
     }
 
+    bool TryStartNeedsRecoveryPath(Colonist colon)
+    {
+        if (colon == null)
+            return false;
+        if (!ShouldPauseForNeedsRecovery(colon))
+        {
+            colon.NeedsRecoveryCell = null;
+            return false;
+        }
+        if (colon.ActiveJob != null)
+            return false;
+        if (colon.Path != null && colon.Path.Count > 0)
+            return false;
+
+        Vector3I recovery = colon.NeedsRecoveryCell ?? FindNeedsRecoveryCell(colon);
+        colon.NeedsRecoveryCell = recovery;
+        if (colon.Position == recovery)
+            return true;
+        if (!pathfinder.IsWalkable(recovery) || IsPositionBlockedByColonist(recovery, colon))
+        {
+            colon.NeedsRecoveryCell = null;
+            return false;
+        }
+
+        var path = pathRequestService.GetOrCreatePath(colon.Position, recovery);
+        if (path == null || path.Count <= 1)
+        {
+            colon.NeedsRecoveryCell = null;
+            return false;
+        }
+
+        path = pathfinder.SmoothPath(new List<Vector3I>(path));
+        if (path == null || path.Count <= 1)
+        {
+            colon.NeedsRecoveryCell = null;
+            return false;
+        }
+
+        path.RemoveAt(0);
+        colon.Path = path;
+        colon.Target = recovery;
+        colon.MoveProgress = 0f;
+        colon.HasPathFailed = false;
+        return true;
+    }
+
+    Vector3I FindNeedsRecoveryCell(Colonist colon)
+    {
+        if (colon == null)
+            return default;
+        if (_recoveryCells.Count > 0)
+        {
+            bool found = false;
+            Vector3I best = default;
+            int bestDist = int.MaxValue;
+            foreach (var c in _recoveryCells)
+            {
+                int d = Mathf.Abs(c.X - colon.Position.X) + Mathf.Abs(c.Y - colon.Position.Y) + Mathf.Abs(c.Z - colon.Position.Z);
+                if (d >= bestDist)
+                    continue;
+                bestDist = d;
+                best = c;
+                found = true;
+            }
+            if (found)
+                return FindNearestFree(best);
+        }
+        var stock = FindNearestStockpileCell(colon.Position);
+        if (stock.HasValue)
+            return FindNearestFree(stock.Value);
+        return FindNearestFree(colon.Position);
+    }
+
     void TryRecoverManualMovePath(Colonist colon)
     {
         if (colon == null)
@@ -1449,7 +1516,7 @@ public partial class Simulation :GodotObject
         }
 
         bool mapChanged = false;
-        bool finished = ApplyVoxelJobProgress(job, out mapChanged);
+        bool finished = ApplyVoxelJobProgress(job, colon, out mapChanged);
         if (!finished)
             return;
 
@@ -1468,19 +1535,9 @@ public partial class Simulation :GodotObject
             pendingWalkabilityRefresh = true;
         }
 
-        Vector3I? rallyAfter = null;
-        if (job.Type == JobType.BuildBlock && job.BuildSiteId != 0
-            && _buildSites.TryGetValue(job.BuildSiteId, out var siteOnComplete))
-        {
-            siteOnComplete.WorkersCommitted.Remove(colonId);
-            siteOnComplete.OnBuildJobCompleted(job.Target);
-            rallyAfter = siteOnComplete.RallyCell;
-            if (siteOnComplete.IsFinished)
-                _buildSites.Remove(job.BuildSiteId);
-        }
-
         TryMoveColonAwayFromHighPerchAfterVoxelJob(colon, job);
         reservationManager.ReleaseByColonist(colonId);
+        _jobAccessFailuresByJobId.Remove(job.Id);
         jobBoard.Complete(job);
         switch (job.Type)
         {
@@ -1496,9 +1553,8 @@ public partial class Simulation :GodotObject
         }
         colon.ActiveJob = null;
         colon.WorkTicksRemaining = 0;
-
-        if (rallyAfter.HasValue && colon.Position != rallyAfter.Value)
-            colon.PostBuildRallyCell = rallyAfter.Value;
+        colon.CarryingResourceType = string.Empty;
+        colon.CarryingResourceAmount = 0;
     }
 
     void TryMoveColonAwayFromHighPerchAfterVoxelJob(Colonist colon, SimJob finishedJob)
@@ -1616,7 +1672,7 @@ public partial class Simulation :GodotObject
         colon.HasPathFailed = false;
     }
 
-    bool ApplyVoxelJobProgress(SimJob job, out bool mapChanged)
+    bool ApplyVoxelJobProgress(SimJob job, Colonist colon, out bool mapChanged)
     {
         mapChanged = false;
         var map = World.CurrentMap;
@@ -1650,7 +1706,8 @@ public partial class Simulation :GodotObject
                     }
 
                     progress.State = VoxelWorkState.InProgress;
-                    progress.Current -= VoxelWorkCatalog.GetMinePowerPerTick(tile.Type);
+                    float minePower = VoxelWorkCatalog.GetMinePowerPerTick(tile.Type) * Mathf.Clamp(colon?.WorkSpeedMultiplier ?? 1f, 0.25f, 1.25f);
+                    progress.Current -= minePower;
                     if (progress.Current > 0f)
                         return false;
 
@@ -1694,7 +1751,8 @@ public partial class Simulation :GodotObject
                     }
 
                     progress.State = VoxelWorkState.InProgress;
-                    progress.Current += VoxelWorkCatalog.GetBuildPowerPerTick(targetType);
+                    float buildPower = VoxelWorkCatalog.GetBuildPowerPerTick(targetType) * Mathf.Clamp(colon?.WorkSpeedMultiplier ?? 1f, 0.25f, 1.25f);
+                    progress.Current += buildPower;
                     if (progress.Current < progress.Max)
                         return false;
 
@@ -1708,19 +1766,55 @@ public partial class Simulation :GodotObject
 
             case JobType.HaulResource:
                 {
-                    if (!_looseResources.TryGetValue(job.Target, out var stack) || stack.Amount <= 0)
+                    // Stage 1: pickup at source (ResourceAmount >= 0), then convert to delivery stage.
+                    if (job.ResourceAmount >= 0)
+                    {
+                        if (!_looseResources.TryGetValue(job.Target, out var stack) || stack.Amount <= 0)
+                            return true;
+
+                        int movedAmount = Mathf.Max(1, job.ResourceAmount > 0 ? Mathf.Min(job.ResourceAmount, stack.Amount) : 1);
+                        stack.Amount -= movedAmount;
+                        if (stack.Amount <= 0)
+                            _looseResources.Remove(job.Target);
+                        else
+                            _looseResources[job.Target] = stack;
+
+                        string key = string.IsNullOrEmpty(job.ResourceType) ? stack.ResourceType : job.ResourceType;
+                        job.ResourceType = key;
+                        job.ResourceAmount = -movedAmount;
+                        colon.CarryingResourceType = key;
+                        colon.CarryingResourceAmount = movedAmount;
+
+                        var dropoffWorkPos = FindNearestFree(job.DropoffTarget);
+                        var path = pathRequestService.GetOrCreatePath(colon.Position, dropoffWorkPos);
+                        if (path != null && path.Count > 1)
+                        {
+                            path = pathfinder.SmoothPath(new List<Vector3I>(path));
+                            if (path != null && path.Count > 1)
+                            {
+                                path.RemoveAt(0);
+                                job.WorkPosition = dropoffWorkPos;
+                                colon.Path = path;
+                                colon.Target = dropoffWorkPos;
+                                colon.MoveProgress = 0f;
+                                colon.WorkTicksRemaining = 0;
+                                return false;
+                            }
+                        }
+
+                        // Fallback safety: deposit directly if delivery path is temporarily impossible.
+                        AddToStockpile(key, movedAmount);
+                        colon.CarryingResourceType = string.Empty;
+                        colon.CarryingResourceAmount = 0;
                         return true;
+                    }
 
-                    int movedAmount = job.ResourceAmount > 0 ? Mathf.Min(job.ResourceAmount, stack.Amount) : 1;
-                    stack.Amount -= movedAmount;
-                    if (stack.Amount <= 0)
-                        _looseResources.Remove(job.Target);
-                    else
-                        _looseResources[job.Target] = stack;
-
-                    string key = string.IsNullOrEmpty(job.ResourceType) ? stack.ResourceType : job.ResourceType;
-                    if (!_stockpileInventory.TryAdd(key, movedAmount))
-                        _stockpileInventory[key] += movedAmount;
+                    // Stage 2: delivery to stockpile.
+                    int delivered = Mathf.Max(1, -job.ResourceAmount);
+                    string deliveredKey = string.IsNullOrEmpty(job.ResourceType) ? "resource" : job.ResourceType;
+                    AddToStockpile(deliveredKey, delivered);
+                    colon.CarryingResourceType = string.Empty;
+                    colon.CarryingResourceAmount = 0;
                     return true;
                 }
         }
@@ -1788,7 +1882,13 @@ public partial class Simulation :GodotObject
     /// forbidSameXzColumn évite d’être pile au-dessus / dessous (même colonne) pour mine & build.
     /// preferDiagonalXz teste d’abord les coins XZ au même Y, puis les côtés, puis l’anneau Manhattan.
     /// </summary>
-    Vector3I FindNearestWalkableAdjacentToBlock(Vector3I blockCell, bool forbidSameXzColumn, bool preferDiagonalXz, bool avoidAboveTarget, SimJob buildContextJob = null)
+    Vector3I FindNearestWalkableAdjacentToBlock(
+        Vector3I blockCell,
+        bool forbidSameXzColumn,
+        bool preferDiagonalXz,
+        bool avoidAboveTarget,
+        SimJob buildContextJob = null,
+        int maxShellRadius = 13)
     {
         bool TryOffset(Vector3I d, out Vector3I found)
         {
@@ -1856,7 +1956,8 @@ public partial class Simulation :GodotObject
             }
         }
 
-        for (int shell = 2; shell < 14; shell++)
+        int shellMax = Mathf.Clamp(maxShellRadius, 2, 24);
+        for (int shell = 2; shell <= shellMax; shell++)
         {
             for (int dx = -shell; dx <= shell; dx++)
             for (int dy = -shell; dy <= shell; dy++)
@@ -1898,12 +1999,13 @@ public partial class Simulation :GodotObject
         if (job == null)
             return;
 
-        if (job.Type == JobType.BuildBlock && job.BuildSiteId != 0
-            && _buildSites.TryGetValue(job.BuildSiteId, out var siteRelease))
+        // If a haul job is interrupted after pickup, drop the carried stack at colon position.
+        if (job.Type == JobType.HaulResource && colon.CarryingResourceAmount > 0)
         {
-            int cid = GetColonistIndex(colon);
-            if (cid >= 0)
-                siteRelease.WorkersCommitted.Remove(cid);
+            var droppedType = string.IsNullOrEmpty(colon.CarryingResourceType) ? job.ResourceType : colon.CarryingResourceType;
+            AddLooseResource(colon.Position, droppedType, colon.CarryingResourceAmount);
+            colon.CarryingResourceType = string.Empty;
+            colon.CarryingResourceAmount = 0;
         }
 
         int colonistId = GetColonistIndex(colon);
@@ -1917,9 +2019,30 @@ public partial class Simulation :GodotObject
         colon.MoveProgress = 0f;
 
         if (waitForAccess)
-            jobBoard.ReleaseJobWaitingForAccess(job, Tick, retryDelayTicks);
+            MarkJobWaitingAccessWithBackoff(job, retryDelayTicks);
         else
+        {
+            _jobAccessFailuresByJobId.Remove(job.Id);
             jobBoard.ReleaseJobAvailable(job);
+        }
+    }
+
+    void MarkJobWaitingAccessWithBackoff(SimJob job, int baseRetryDelayTicks = 8)
+    {
+        if (job == null)
+            return;
+
+        int baseDelay = Mathf.Max(1, baseRetryDelayTicks);
+        _jobAccessFailuresByJobId.TryGetValue(job.Id, out int failCount);
+        failCount++;
+        _jobAccessFailuresByJobId[job.Id] = failCount;
+
+        int expCap = job.Type == JobType.BuildBlock ? 2 : 3;
+        int maxDelay = job.Type == JobType.BuildBlock ? 24 : 64;
+        int exp = Mathf.Clamp(failCount - 1, 0, expCap);
+        int delay = baseDelay * (1 << exp);
+        delay = Mathf.Clamp(delay, baseDelay, maxDelay);
+        jobBoard.ReleaseJobWaitingForAccess(job, Tick, retryDelayTicks: delay);
     }
 
     bool IsPositionBlockedByColonist(Vector3I pos, Colonist ignore = null)
@@ -2112,6 +2235,7 @@ public partial class Simulation :GodotObject
         int looseTotal = 0;
         foreach (var stack in _looseResources.Values)
             looseTotal += stack.Amount;
+        int blockedJobs = _jobAccessFailuresByJobId.Count;
         sb.Append("Stock : ");
         if (_stockpileInventory.Count == 0)
             sb.Append("vide");
@@ -2127,7 +2251,181 @@ public partial class Simulation :GodotObject
             }
         }
         sb.Append(" | Sol : ").Append(looseTotal).Append(" (").Append(looseStacks).Append(" pile(s))");
+        sb.Append(" | Jobs bloqués : ").Append(blockedJobs);
+        AppendColonistActivitySummary(sb);
         return sb.ToString();
+    }
+
+    void AddToStockpile(string resourceType, int amount)
+    {
+        if (amount <= 0)
+            return;
+        string key = string.IsNullOrEmpty(resourceType) ? "resource" : resourceType;
+        if (!_stockpileInventory.TryAdd(key, amount))
+            _stockpileInventory[key] += amount;
+    }
+
+    void UpdateColonNeeds(Colonist colon)
+    {
+        if (colon == null)
+            return;
+
+        bool hasPath = colon.Path != null && colon.Path.Count > 0;
+        bool isWorking = colon.ActiveJob != null && !hasPath && colon.WorkTicksRemaining > 0;
+        bool isRecoveringInPlace = colon.ActiveJob == null
+            && !hasPath
+            && colon.NeedsRecoveryCell.HasValue
+            && colon.Position == colon.NeedsRecoveryCell.Value;
+
+        if (isRecoveringInPlace)
+            colon.Hunger += Mathf.Max(0f, ColonNeedHungerRecoveryAtRecoveryCellPerTick);
+        else
+            colon.Hunger -= Mathf.Max(0f, ColonNeedHungerDecayPerTick);
+
+        if (isWorking)
+            colon.Rest -= Mathf.Max(0f, ColonNeedRestDecayWorkPerTick);
+        else if (hasPath)
+            colon.Rest -= Mathf.Max(0f, ColonNeedRestDecayMovePerTick);
+        else if (isRecoveringInPlace)
+            colon.Rest += Mathf.Max(0f, ColonNeedRestRecoveryAtRecoveryCellPerTick);
+        else
+            colon.Rest += Mathf.Max(0f, ColonNeedRestRecoveryIdlePerTick);
+
+        colon.Hunger = Mathf.Clamp(colon.Hunger, 0f, 100f);
+        colon.Rest = Mathf.Clamp(colon.Rest, 0f, 100f);
+
+        if (colon.NeedsRecoveryCell.HasValue
+            && colon.Hunger >= ColonNeedLowThreshold
+            && colon.Rest >= ColonNeedLowThreshold)
+            colon.NeedsRecoveryCell = null;
+
+        float hungerRatio = Mathf.Clamp(colon.Hunger / 100f, 0.20f, 1f);
+        float restRatio = Mathf.Clamp(colon.Rest / 100f, 0.20f, 1f);
+        float moveFactor = Mathf.Clamp(restRatio * 0.80f + hungerRatio * 0.20f, 0.30f, 1f);
+        float workFactor = Mathf.Clamp(restRatio * 0.65f + hungerRatio * 0.35f, 0.25f, 1f);
+
+        colon.MoveSpeed = Mathf.Max(1.2f, colon.BaseMoveSpeed * moveFactor);
+        colon.WorkSpeedMultiplier = workFactor;
+    }
+
+    bool ShouldPauseForNeedsRecovery(Colonist colon)
+    {
+        if (colon == null)
+            return false;
+        if (colon.ActiveJob != null)
+            return false;
+        if (colon.Path != null && colon.Path.Count > 0)
+            return false;
+        bool critical = colon.Rest < ColonNeedCriticalThreshold || colon.Hunger < ColonNeedCriticalThreshold;
+        bool continueRecovery = colon.NeedsRecoveryCell.HasValue
+            && (colon.Rest < ColonNeedLowThreshold || colon.Hunger < ColonNeedLowThreshold);
+        return critical || continueRecovery;
+    }
+
+    void UpdateColonActivity(Colonist colon)
+    {
+        if (colon == null)
+            return;
+
+        if (colon.HasPathFailed)
+        {
+            colon.ActivityState = ColonistActivityState.Stuck;
+            return;
+        }
+
+        bool hasPath = colon.Path != null && colon.Path.Count > 0;
+        var job = colon.ActiveJob;
+        if (job == null)
+        {
+            if (!hasPath && ShouldPauseForNeedsRecovery(colon))
+            {
+                colon.ActivityState = ColonistActivityState.Resting;
+                return;
+            }
+            colon.ActivityState = hasPath ? ColonistActivityState.Moving : ColonistActivityState.Idle;
+            return;
+        }
+
+        if (job.Type == JobType.HaulResource)
+        {
+            if (hasPath)
+            {
+                colon.ActivityState = job.ResourceAmount < 0
+                    ? ColonistActivityState.HaulingDeliver
+                    : ColonistActivityState.HaulingPickup;
+                return;
+            }
+
+            colon.ActivityState = job.ResourceAmount < 0
+                ? ColonistActivityState.HaulingDeliver
+                : ColonistActivityState.HaulingPickup;
+            return;
+        }
+
+        if (hasPath)
+            colon.ActivityState = ColonistActivityState.MovingToWork;
+        else
+            colon.ActivityState = colon.WorkTicksRemaining > 0 ? ColonistActivityState.Working : ColonistActivityState.MovingToWork;
+    }
+
+    void AppendColonistActivitySummary(StringBuilder sb)
+    {
+        var map = World?.CurrentMap;
+        if (map == null || map.Colonists.Count == 0)
+            return;
+
+        int idle = 0, resting = 0, moving = 0, work = 0, haul = 0, stuck = 0;
+        int tracked = 0;
+        int criticalNeeds = 0;
+        float hungerSum = 0f;
+        float restSum = 0f;
+        foreach (var colon in map.Colonists)
+        {
+            if (colon.OwnerId != 0)
+                continue;
+            tracked++;
+            hungerSum += colon.Hunger;
+            restSum += colon.Rest;
+            if (colon.Hunger < ColonNeedCriticalThreshold || colon.Rest < ColonNeedCriticalThreshold)
+                criticalNeeds++;
+
+            switch (colon.ActivityState)
+            {
+                case ColonistActivityState.Stuck:
+                    stuck++;
+                    break;
+                case ColonistActivityState.Resting:
+                    resting++;
+                    break;
+                case ColonistActivityState.HaulingPickup:
+                case ColonistActivityState.HaulingDeliver:
+                    haul++;
+                    break;
+                case ColonistActivityState.Working:
+                    work++;
+                    break;
+                case ColonistActivityState.Moving:
+                case ColonistActivityState.MovingToWork:
+                    moving++;
+                    break;
+                default:
+                    idle++;
+                    break;
+            }
+        }
+
+        float avgHunger = tracked > 0 ? hungerSum / tracked : 0f;
+        float avgRest = tracked > 0 ? restSum / tracked : 0f;
+
+        sb.Append(" | Colons : idle=").Append(idle)
+            .Append(" rest=").Append(resting)
+            .Append(" move=").Append(moving)
+            .Append(" work=").Append(work)
+            .Append(" haul=").Append(haul)
+            .Append(" stuck=").Append(stuck)
+            .Append(" need!=").Append(criticalNeeds)
+            .Append(" H=").Append(Mathf.RoundToInt(avgHunger))
+            .Append(" R=").Append(Mathf.RoundToInt(avgRest));
     }
 
     public string ExportSaveJson()
@@ -2141,7 +2439,8 @@ public partial class Simulation :GodotObject
             Designations = new List<DesignationSaveData>(),
             LooseResources = new List<ResourceSaveData>(),
             StockpileInventory = new Dictionary<string, int>(_stockpileInventory, StringComparer.Ordinal),
-            StockpileCells = new List<Int3SaveData>()
+            StockpileCells = new List<Int3SaveData>(),
+            RecoveryCells = new List<Int3SaveData>()
         };
 
         var map = World.CurrentMap;
@@ -2151,7 +2450,9 @@ public partial class Simulation :GodotObject
             {
                 OwnerId = colon.OwnerId,
                 Position = new Int3SaveData(colon.Position),
-                Target = new Int3SaveData(colon.Target)
+                Target = new Int3SaveData(colon.Target),
+                Hunger = colon.Hunger,
+                Rest = colon.Rest
             });
         }
 
@@ -2195,7 +2496,7 @@ public partial class Simulation :GodotObject
                 RetryAfterTick = job.RetryAfterTick,
                 EnqueueOrder = job.EnqueueOrder,
                 BuildTileType = job.BuildTileType,
-                BuildSiteId = job.BuildSiteId,
+                BuildSiteId = 0,
                 ResourceType = job.ResourceType,
                 ResourceAmount = job.ResourceAmount,
                 DropoffTarget = new Int3SaveData(job.DropoffTarget)
@@ -2251,8 +2552,97 @@ public partial class Simulation :GodotObject
 
         foreach (var c in _stockpileCells)
             data.StockpileCells.Add(new Int3SaveData(c));
+        foreach (var c in _recoveryCells)
+            data.RecoveryCells.Add(new Int3SaveData(c));
 
         return JsonSerializer.Serialize(data, new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    public void CopyBuildFrontierDebug(List<BuildFrontierDebugCell> buffer, int maxCells = 256)
+    {
+        if (buffer == null)
+            return;
+        buffer.Clear();
+        if (maxCells <= 0 || World?.CurrentMap == null || jobBoard == null)
+            return;
+
+        var map = World.CurrentMap;
+        _buildFrontierPendingScratch.Clear();
+
+        designationBoard.CopyByType(DesignationType.Build, _designationScratch, onlyUnplanned: false);
+        foreach (var d in _designationScratch)
+        {
+            var tile = map.GetTile(d.Target);
+            if (tile == null)
+                continue;
+            bool hasActive = jobBoard.HasActiveJobOnTarget(d.Target, JobType.BuildBlock);
+            if (tile.Solid && !hasActive)
+                continue;
+            _buildFrontierPendingScratch.Add(d.Target);
+        }
+
+        _buildActiveTargetsScratch.Clear();
+        jobBoard.CopyActiveTargets(JobType.BuildBlock, _buildActiveTargetsScratch);
+        foreach (var c in _buildActiveTargetsScratch)
+        {
+            var tile = map.GetTile(c);
+            if (tile == null || tile.Solid)
+                continue;
+            _buildFrontierPendingScratch.Add(c);
+        }
+
+        if (_buildFrontierPendingScratch.Count == 0)
+            return;
+
+        _buildPlanSortBuffer.Clear();
+        foreach (var c in _buildFrontierPendingScratch)
+            _buildPlanSortBuffer.Add(c);
+
+        Vector3I anchor = _buildPlanSortBuffer[0];
+        foreach (var colon in map.Colonists)
+        {
+            if (colon.OwnerId != 0)
+                continue;
+            anchor = colon.Position;
+            break;
+        }
+
+        ConstructionPlanner.SortBuildCellsForPlanning(
+            _buildPlanSortBuffer,
+            anchor,
+            (p) =>
+            {
+                var t = map.GetTile(p);
+                return t != null && t.Solid;
+            },
+            (p) => pathfinder.IsWalkable(p)
+        );
+
+        int maxOut = Mathf.Max(1, maxCells);
+        foreach (var c in _buildPlanSortBuffer)
+        {
+            bool supported = ConstructionPlanner.HasSupportForDebug(
+                c,
+                _buildFrontierPendingScratch,
+                (p) =>
+                {
+                    var t = map.GetTile(p);
+                    return t != null && t.Solid;
+                });
+            bool hasWalkSpot = ConstructionPlanner.HasImmediateWalkableWorkSpotForDebug(c, pathfinder.IsWalkable);
+            var state = !supported
+                ? BuildFrontierDebugState.Unsupported
+                : (hasWalkSpot ? BuildFrontierDebugState.Ready : BuildFrontierDebugState.SupportedNoWalkSpot);
+
+            buffer.Add(new BuildFrontierDebugCell
+            {
+                Position = c,
+                State = state
+            });
+
+            if (buffer.Count >= maxOut)
+                break;
+        }
     }
 
     public void ImportSaveJson(string json)
@@ -2269,11 +2659,22 @@ public partial class Simulation :GodotObject
         map.Colonists.Clear();
         foreach (var c in data.Colonists)
         {
+            float importedHunger = c.Hunger;
+            float importedRest = c.Rest;
+            // Backward compatibility for saves created before needs existed.
+            if (importedHunger <= 0f && importedRest <= 0f)
+            {
+                importedHunger = 100f;
+                importedRest = 100f;
+            }
+
             map.Colonists.Add(new Colonist
             {
                 OwnerId = c.OwnerId,
                 Position = c.Position.ToVector3I(),
-                Target = c.Target.ToVector3I()
+                Target = c.Target.ToVector3I(),
+                Hunger = Mathf.Clamp(importedHunger, 0f, 100f),
+                Rest = Mathf.Clamp(importedRest, 0f, 100f)
             });
         }
 
@@ -2288,6 +2689,7 @@ public partial class Simulation :GodotObject
         }
 
         jobBoard = new JobBoard();
+        _jobAccessFailuresByJobId.Clear();
         foreach (var j in data.Jobs)
         {
             jobBoard.AddJob(new SimJob
@@ -2300,7 +2702,7 @@ public partial class Simulation :GodotObject
                 RetryAfterTick = j.RetryAfterTick,
                 EnqueueOrder = j.EnqueueOrder,
                 BuildTileType = j.BuildTileType,
-                BuildSiteId = j.BuildSiteId,
+                BuildSiteId = 0,
                 ResourceType = j.ResourceType,
                 ResourceAmount = j.ResourceAmount,
                 DropoffTarget = j.DropoffTarget.ToVector3I()
@@ -2344,6 +2746,12 @@ public partial class Simulation :GodotObject
         {
             foreach (var c in data.StockpileCells)
                 _stockpileCells.Add(c.ToVector3I());
+        }
+        _recoveryCells.Clear();
+        if (data.RecoveryCells != null)
+        {
+            foreach (var c in data.RecoveryCells)
+                _recoveryCells.Add(c.ToVector3I());
         }
     }
 

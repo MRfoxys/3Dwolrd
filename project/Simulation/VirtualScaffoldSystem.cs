@@ -12,7 +12,6 @@ public sealed class VirtualScaffoldSystem
 {
     readonly HashSet<Vector3I> _cells = new();
     readonly HashSet<Vector3I> _seededTargets = new();
-    readonly HashSet<int> _seededBuildSites = new();
     int _version;
 
     public IReadOnlyCollection<Vector3I> Cells => _cells;
@@ -22,17 +21,15 @@ public sealed class VirtualScaffoldSystem
     {
         _cells.Clear();
         _seededTargets.Clear();
-        _seededBuildSites.Clear();
         _version = 0;
     }
 
     public bool ClearAllScaffolds()
     {
-        if (_cells.Count == 0 && _seededTargets.Count == 0 && _seededBuildSites.Count == 0)
+        if (_cells.Count == 0 && _seededTargets.Count == 0)
             return false;
         _cells.Clear();
         _seededTargets.Clear();
-        _seededBuildSites.Clear();
         _version++;
         return true;
     }
@@ -44,14 +41,6 @@ public sealed class VirtualScaffoldSystem
     public void MarkTargetSeeded(Vector3I target) => _seededTargets.Add(target);
 
     public void ClearTargetSeeded(Vector3I target) => _seededTargets.Remove(target);
-
-    public bool IsBuildSiteSeeded(int buildSiteId) => buildSiteId != 0 && _seededBuildSites.Contains(buildSiteId);
-
-    public void MarkBuildSiteSeeded(int buildSiteId)
-    {
-        if (buildSiteId != 0)
-            _seededBuildSites.Add(buildSiteId);
-    }
 
     public bool HasNearby(Vector3I around, int radius)
     {
@@ -68,9 +57,7 @@ public sealed class VirtualScaffoldSystem
     public bool TryGenerateColumn(
         Map map,
         JobBoard jobBoard,
-        Dictionary<int, BuildSite> buildSites,
         Vector3I target,
-        int buildSiteId,
         Func<Vector3I, bool> hasPathProbe,
         out int generatedCount)
     {
@@ -96,10 +83,6 @@ public sealed class VirtualScaffoldSystem
             if (standTile == null || standTile.Solid)
                 continue;
             if (jobBoard.HasActiveJobOnTarget(stand, JobType.BuildBlock))
-                continue;
-            if (buildSiteId != 0
-                && buildSites.TryGetValue(buildSiteId, out var site)
-                && site.PendingTargets.Contains(stand))
                 continue;
 
             if (!TryFindSupportY(map, stand, maxSupportScanDepth, out int supportY))

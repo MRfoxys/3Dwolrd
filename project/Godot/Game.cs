@@ -13,6 +13,13 @@ public partial class Game : Node3D
         High
     }
 
+    enum ZonePaintMode
+    {
+        None,
+        Stockpile,
+        Recovery
+    }
+
     [ExportGroup("Chunk Visibility Update")]
     /// <summary>Fréquence de mise à jour de la visibilité des chunks (en ticks simulation).</summary>
     [Export(PropertyHint.Range, "1,12,1")]
@@ -198,10 +205,36 @@ public partial class Game : Node3D
     [Export] public bool ShowVirtualScaffolds = true;
     [Export(PropertyHint.Range, "0.05,1,0.01")]
     public float VirtualScaffoldAlpha = 0.3f;
+    [Export] public bool ShowBuildFrontierDebug = false;
+    [Export(PropertyHint.Range, "0.05,1,0.01")]
+    public float BuildFrontierDebugAlpha = 0.4f;
+    [Export(PropertyHint.Range, "1,12,1")]
+    public int BuildFrontierDebugRefreshTicks = 2;
+    [Export(PropertyHint.Range, "16,4096,16")]
+    public int BuildFrontierDebugMaxInstances = 384;
+    [Export(PropertyHint.Range, "1,12,1")]
+    public int BuildQueuedPreviewRefreshTicks = 3;
+    [Export(PropertyHint.Range, "16,4096,16")]
+    public int BuildQueuedPreviewMaxInstances = 512;
     [Export] public Key BuildLayerUpKey = Key.Pageup;
     [Export] public Key BuildLayerDownKey = Key.Pagedown;
     [Export] public Key BuildDepthUpKey = Key.R;
     [Export] public Key BuildDepthDownKey = Key.F;
+    [Export] public Key SetStockpileKey = Key.G;
+    [Export] public Key AddStockpileKey = Key.H;
+    [Export] public Key ClearStockpileKey = Key.N;
+    [Export] public Key SetRecoveryZoneKey = Key.J;
+    [Export] public Key AddRecoveryZoneKey = Key.K;
+    [Export] public Key ClearRecoveryZoneKey = Key.M;
+    [Export] public Key ZonePaintStockpileKey = Key.Y;
+    [Export] public Key ZonePaintRecoveryKey = Key.U;
+    [Export] public Key ZonePaintDisableKey = Key.I;
+    [Export] public bool ShowStockpileCells = true;
+    [Export] public bool ShowRecoveryCells = true;
+    [Export(PropertyHint.Range, "1,12,1")]
+    public int HudRefreshIntervalTicks = 2;
+    [Export(PropertyHint.Range, "1,20,1")]
+    public int TreeOverlayRefreshIntervalTicks = 4;
 
     HashSet<Vector3I> currentNeededChunks = new();
 
@@ -254,6 +287,8 @@ public partial class Game : Node3D
     ChunkQualityProfile _activeChunkQualityProfile = ChunkQualityProfile.Auto;
     string _activeChunkQualityReason = "scene_defaults";
     float lastFrameDeltaSeconds = 0f;
+    int _lastHudRefreshTick = -1;
+    int _lastTreeOverlayRefreshTick = -1;
 
     WorldSelectionTargetKind _selectionTargetKind = WorldSelectionTargetKind.Colonists;
     Vector3I? _selectedTreeTile;
@@ -265,7 +300,11 @@ public partial class Game : Node3D
     readonly List<Vector3I> _terrainLineBuffer = new();
     readonly List<Vector3I> _mineSelectionSortBuffer = new();
     readonly List<Vector3I> _orderedVoxelSelectionBuffer = new();
+    readonly List<Vector3I> _zonePaintResolvedBuffer = new();
+    readonly HashSet<Vector3I> _zonePaintResolvedSet = new();
     readonly List<Vector3I> _queuedBuildTargetsBuffer = new();
+    readonly List<Vector3I> _queuedBuildVisiblePreviewBuffer = new();
+    ZonePaintMode _zonePaintMode = ZonePaintMode.None;
     int _lastBuildQueuedPreviewRefreshTick = -1;
     bool _verticalSliceTerrainActive;
     bool _verticalSliceTerrainWasActive;
@@ -297,6 +336,7 @@ public partial class Game : Node3D
 
     Label _selectionModeLabel;
     Label _treeTargetLabel;
+    Label _colonNeedsLabel;
     Button _btnModeColonists;
     Button _btnModeTrees;
     Button _btnCutTree;
@@ -313,6 +353,21 @@ public partial class Game : Node3D
     StandardMaterial3D _virtualScaffoldPreviewMaterial;
     int _lastVirtualScaffoldPreviewVersion = -1;
     bool _lastVirtualScaffoldPreviewVisible;
+    MultiMeshInstance3D _buildFrontierDebugPreview;
+    StandardMaterial3D _buildFrontierDebugMaterial;
+    readonly List<BuildFrontierDebugCell> _buildFrontierDebugBuffer = new();
+    int _lastBuildFrontierDebugRefreshTick = -1;
+    bool _lastBuildFrontierDebugVisible;
+    MultiMeshInstance3D _stockpilePreview;
+    StandardMaterial3D _stockpilePreviewMaterial;
+    int _lastStockpilePreviewCount = -1;
+    int _lastStockpilePreviewHash = int.MinValue;
+    bool _lastStockpilePreviewVisible;
+    MultiMeshInstance3D _recoveryZonePreview;
+    StandardMaterial3D _recoveryZonePreviewMaterial;
+    int _lastRecoveryZonePreviewCount = -1;
+    int _lastRecoveryZonePreviewHash = int.MinValue;
+    bool _lastRecoveryZonePreviewVisible;
     int _buildSelectionLayerY = Map.ColonistWalkY;
     bool _buildSelectionLayerInitialized;
     int _buildExtrudeDepth = 1;
@@ -322,6 +377,8 @@ public partial class Game : Node3D
     Label _terrainTileLabel;
     Label _buildStatusLabel;
     Label _perfProfileLabel;
+    PanelContainer _selectionPanel;
+    VBoxContainer _selectionPanelVBox;
     VBoxContainer _perfControlsBox;
     OptionButton _perfProfileOption;
     CheckBox _perfAdaptiveBudgetCheck;
@@ -366,8 +423,11 @@ public partial class Game : Node3D
         
 
         selectionRect = GetNode<ColorRect>("UI/SelectionRect");
+        _selectionPanel = GetNodeOrNull<PanelContainer>("UI/SelectionPanel");
+        _selectionPanelVBox = GetNodeOrNull<VBoxContainer>("UI/SelectionPanel/VBox");
         _selectionModeLabel = GetNodeOrNull<Label>("UI/SelectionPanel/VBox/ModeLabel");
         _treeTargetLabel = GetNodeOrNull<Label>("UI/SelectionPanel/VBox/TreeTargetLabel");
+        _colonNeedsLabel = GetNodeOrNull<Label>("UI/SelectionPanel/VBox/ColonNeedsLabel");
         _btnModeColonists = GetNodeOrNull<Button>("UI/SelectionPanel/VBox/ModeRow/BtnColonists");
         _btnModeTrees = GetNodeOrNull<Button>("UI/SelectionPanel/VBox/ModeRow/BtnTrees");
         _btnCutTree = GetNodeOrNull<Button>("UI/SelectionPanel/VBox/BtnCutTree");
@@ -396,6 +456,16 @@ public partial class Game : Node3D
                 vbox.AddChild(_perfProfileLabel);
             }
         }
+        if (_colonNeedsLabel == null)
+        {
+            var vbox = GetNodeOrNull<VBoxContainer>("UI/SelectionPanel/VBox");
+            if (vbox != null)
+            {
+                _colonNeedsLabel = new Label { Name = "ColonNeedsLabel" };
+                vbox.AddChild(_colonNeedsLabel);
+            }
+        }
+        ConfigureSelectionPanelUiSizing();
         InitPerformanceControlsUi();
         LoadSavedPerformanceRuntimeSettings();
         SyncPerformanceControlsFromState();
@@ -438,6 +508,9 @@ public partial class Game : Node3D
         InitBuildDragPreviewVisual();
         InitBuildQueuedPreviewVisual();
         InitVirtualScaffoldPreviewVisual();
+        InitBuildFrontierDebugPreviewVisual();
+        InitStockpilePreviewVisual();
+        InitRecoveryZonePreviewVisual();
 
         cameraController = new CameraController(cameraPivot, camera);
         selectionManager = new SelectionManager(camera, colonVisuals, localPlayerId);
@@ -449,6 +522,35 @@ public partial class Game : Node3D
         sim.OnJobStarted   += OnJobStarted;
         sim.OnJobCompleted   += OnJobCompleted;
         lockstep.OnSnapshotDivergence += OnLockstepDivergence;
+    }
+
+    void ConfigureSelectionPanelUiSizing()
+    {
+        if (_selectionPanel != null)
+        {
+            _selectionPanel.MouseFilter = Control.MouseFilterEnum.Stop;
+            _selectionPanel.ClipContents = true;
+        }
+        if (_selectionPanelVBox != null)
+            _selectionPanelVBox.MouseFilter = Control.MouseFilterEnum.Stop;
+
+        ConfigureInfoLabel(_selectionModeLabel, wrap: false);
+        ConfigureInfoLabel(_treeTargetLabel, wrap: true);
+        ConfigureInfoLabel(_colonNeedsLabel, wrap: true);
+        ConfigureInfoLabel(_terrainTileLabel, wrap: true);
+        ConfigureInfoLabel(_buildStatusLabel, wrap: true);
+        ConfigureInfoLabel(_jobsQueueLabel, wrap: true);
+        ConfigureInfoLabel(_logisticsLabel, wrap: true);
+        ConfigureInfoLabel(_perfProfileLabel, wrap: true);
+    }
+
+    static void ConfigureInfoLabel(Label label, bool wrap)
+    {
+        if (label == null)
+            return;
+        label.MouseFilter = Control.MouseFilterEnum.Ignore;
+        label.ClipText = true;
+        label.AutowrapMode = wrap ? TextServer.AutowrapMode.WordSmart : TextServer.AutowrapMode.Off;
     }
 
     public override void _Process(double delta)
@@ -463,6 +565,10 @@ public partial class Game : Node3D
         UpdateBuildDragPreviewVisual();
         UpdateBuildQueuedPreviewVisual();
         UpdateVirtualScaffoldPreviewVisual();
+        UpdateBuildFrontierDebugPreviewVisual();
+        UpdateStockpilePreviewVisual();
+        UpdateRecoveryZonePreviewVisual();
+        RefreshColonNeedsUi();
         if (_selectionTargetKind == WorldSelectionTargetKind.BuildBlocks)
             RefreshBuildStatusLabel();
 
@@ -478,6 +584,7 @@ public partial class Game : Node3D
             accumulator -= TICK_RATE;
             tickAdvanced = true;
         }
+        bool peelAppliedThisFrame = false;
 
         UpdateSelectionRect();
 
@@ -493,7 +600,10 @@ public partial class Game : Node3D
             lastNeededChunkCount = currentNeededChunks.Count;
             // Évite une frame où les nouveaux chunks sont à taille 1 avant le pelage (artefacts au zoom).
             if (_verticalSliceTerrainActive)
+            {
                 ApplyMultimeshOcclusionPeels();
+                peelAppliedThisFrame = true;
+            }
         }
         int visibilityInterval = Mathf.Max(1, ChunkVisibilityIntervalTicks);
         if (tickAdvanced && sim.Tick % visibilityInterval == 0 && sim.Tick != lastChunkVisibilityTick)
@@ -510,10 +620,21 @@ public partial class Game : Node3D
         UpdateBenchmarkAutoCameraPath((float)delta);
         bool hasCutFocus = TryGetSmartCutFocusPoint(out Vector3 cutFocus);
         UpdateSmartCutShaderParameters(hasCutFocus, cutFocus);
-        RefreshJobsQueueUi();
+        int hudInterval = Mathf.Max(1, HudRefreshIntervalTicks);
+        if (_lastHudRefreshTick < 0 || sim.Tick - _lastHudRefreshTick >= hudInterval)
+        {
+            RefreshJobsQueueUi();
+            _lastHudRefreshTick = sim.Tick;
+        }
         RefreshPerformanceProfileLabel();
-        RefreshTreeJobOverlays();
-        if (_verticalSliceTerrainActive || _verticalSliceTerrainWasActive || _terrainOcclusionHidden.Count > 0)
+        int treeOverlayInterval = Mathf.Max(1, TreeOverlayRefreshIntervalTicks);
+        if (_lastTreeOverlayRefreshTick < 0 || sim.Tick - _lastTreeOverlayRefreshTick >= treeOverlayInterval)
+        {
+            RefreshTreeJobOverlays();
+            _lastTreeOverlayRefreshTick = sim.Tick;
+        }
+        if (!peelAppliedThisFrame
+            && (_verticalSliceTerrainActive || _verticalSliceTerrainWasActive || _terrainOcclusionHidden.Count > 0))
             ApplyMultimeshOcclusionPeels();
         ApplyTerrainSelectionHighlights();
         SyncTreeResourcesVisibilityWithOcclusion();
@@ -621,6 +742,96 @@ public partial class Game : Node3D
             {
                 _buildExtrudeDepth = Mathf.Clamp(_buildExtrudeDepth - 1, 1, 128);
                 GD.Print($"[Build] Profondeur = {_buildExtrudeDepth}");
+                UpdateSelectionTargetUi();
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+
+            if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles
+                && _inputModule.IsShortcut(key, SetStockpileKey))
+            {
+                int added = sim.SetStockpileCells(_selectedTerrainTiles, replace: true);
+                GD.Print($"[Zones] Stockpile remplacé ({added} cellule(s)).");
+                UpdateSelectionTargetUi();
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+
+            if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles
+                && _inputModule.IsShortcut(key, AddStockpileKey))
+            {
+                int added = sim.SetStockpileCells(_selectedTerrainTiles, replace: false);
+                GD.Print($"[Zones] Stockpile +{added} cellule(s).");
+                UpdateSelectionTargetUi();
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+
+            if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles
+                && _inputModule.IsShortcut(key, ClearStockpileKey))
+            {
+                sim.ClearStockpileCells();
+                GD.Print("[Zones] Stockpile vidé.");
+                UpdateSelectionTargetUi();
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+
+            if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles
+                && _inputModule.IsShortcut(key, SetRecoveryZoneKey))
+            {
+                int added = sim.SetRecoveryCells(_selectedTerrainTiles, replace: true);
+                GD.Print($"[Zones] Récupération remplacée ({added} cellule(s)).");
+                UpdateSelectionTargetUi();
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+
+            if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles
+                && _inputModule.IsShortcut(key, AddRecoveryZoneKey))
+            {
+                int added = sim.SetRecoveryCells(_selectedTerrainTiles, replace: false);
+                GD.Print($"[Zones] Récupération +{added} cellule(s).");
+                UpdateSelectionTargetUi();
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+
+            if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles
+                && _inputModule.IsShortcut(key, ClearRecoveryZoneKey))
+            {
+                sim.ClearRecoveryCells();
+                GD.Print("[Zones] Récupération vidée.");
+                UpdateSelectionTargetUi();
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+
+            if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles
+                && _inputModule.IsShortcut(key, ZonePaintStockpileKey))
+            {
+                _zonePaintMode = _zonePaintMode == ZonePaintMode.Stockpile ? ZonePaintMode.None : ZonePaintMode.Stockpile;
+                GD.Print($"[Zones] Pinceau stockpile: {(_zonePaintMode == ZonePaintMode.Stockpile ? "ON" : "OFF")}");
+                UpdateSelectionTargetUi();
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+
+            if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles
+                && _inputModule.IsShortcut(key, ZonePaintRecoveryKey))
+            {
+                _zonePaintMode = _zonePaintMode == ZonePaintMode.Recovery ? ZonePaintMode.None : ZonePaintMode.Recovery;
+                GD.Print($"[Zones] Pinceau récupération: {(_zonePaintMode == ZonePaintMode.Recovery ? "ON" : "OFF")}");
+                UpdateSelectionTargetUi();
+                GetViewport().SetInputAsHandled();
+                return;
+            }
+
+            if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles
+                && _inputModule.IsShortcut(key, ZonePaintDisableKey))
+            {
+                _zonePaintMode = ZonePaintMode.None;
+                GD.Print("[Zones] Pinceau zones: OFF");
                 UpdateSelectionTargetUi();
                 GetViewport().SetInputAsHandled();
                 return;
@@ -757,6 +968,13 @@ public partial class Game : Node3D
                     $"benchmark_t={_perfBenchmarkElapsedSec:0.0}s " +
                     $"profile={_activeChunkQualityProfile} " +
                     $"profile_reason={_activeChunkQualityReason} last_us={lastChunkRefreshMicroseconds}");
+            }
+
+            if (key.Keycode == Key.F12)
+            {
+                ShowBuildFrontierDebug = !ShowBuildFrontierDebug;
+                _lastBuildFrontierDebugRefreshTick = -1;
+                GD.Print($"BUILD FRONTIER DEBUG: {ShowBuildFrontierDebug}");
             }
 
             if (key.Keycode == Key.F4)
@@ -2502,6 +2720,7 @@ public partial class Game : Node3D
             _terrainMineDragTracking = false;
             _terrainMineDragStartCell = null;
             _terrainMineDragPreview.Clear();
+            _zonePaintMode = ZonePaintMode.None;
         }
         if (kind != WorldSelectionTargetKind.BuildBlocks)
         {
@@ -2522,7 +2741,7 @@ public partial class Game : Node3D
             {
                 WorldSelectionTargetKind.Colonists => "Cible : Colons (clic / cadre) — survol voxel comme blocs",
                 WorldSelectionTargetKind.Trees => "Cible : Arbres — même visée que blocs (coupe V, Q/Alt fond) · survol surligné",
-                WorldSelectionTargetKind.TerrainTiles => "Cible : Blocs — clic = 1 · glisser = ligne mineable · Shift = ajouter · B = mode build · Q/Alt = fond · V = coupe",
+                WorldSelectionTargetKind.TerrainTiles => $"Cible : Blocs — clic=1 glisser=zone · Y pinceau stock · U pinceau récup · I off · mode={GetZonePaintModeLabel()}",
                 WorldSelectionTargetKind.BuildBlocks => "Cible : Build — détails et couche dans le bandeau bleu ci‑dessous",
                 _ => "Cible : —"
             };
@@ -2537,8 +2756,11 @@ public partial class Game : Node3D
 
         if (_terrainTileLabel != null)
         {
+            int stockCount = sim?.StockpileCells?.Count ?? 0;
+            int recoverCount = sim?.RecoveryCells?.Count ?? 0;
+            string paintMode = GetZonePaintModeLabel();
             if (_selectedTerrainTiles.Count == 0)
-                _terrainTileLabel.Text = "Blocs : (aucun)";
+                _terrainTileLabel.Text = $"Blocs : (aucun) · Stock={stockCount} · Récup={recoverCount} · Pinceau={paintMode}";
             else if (_selectedTerrainTiles.Count == 1)
             {
                 Vector3I only = default;
@@ -2547,10 +2769,10 @@ public partial class Game : Node3D
                     only = v;
                     break;
                 }
-                _terrainTileLabel.Text = $"Blocs : 1 — {only}";
+                _terrainTileLabel.Text = $"Blocs : 1 — {only} · Stock={stockCount} · Récup={recoverCount} · Pinceau={paintMode}";
             }
             else
-                _terrainTileLabel.Text = $"Blocs : {_selectedTerrainTiles.Count} sélectionnés";
+                _terrainTileLabel.Text = $"Blocs : {_selectedTerrainTiles.Count} sélectionnés · Stock={stockCount} · Récup={recoverCount} · Pinceau={paintMode}";
         }
 
         if (_btnCutTree != null)
@@ -2558,6 +2780,7 @@ public partial class Game : Node3D
 
         RefreshMineStoneButtonState();
         RefreshBuildStatusLabel();
+        RefreshColonNeedsUi();
     }
 
     void RefreshBuildStatusLabel()
@@ -2575,7 +2798,7 @@ public partial class Game : Node3D
         sb.Append("Couche Y = ").Append(_buildSelectionLayerY);
         sb.Append("  ·  Profondeur = ").Append(_buildExtrudeDepth);
         sb.AppendLine();
-        sb.Append("Shift+molette ou PgUp/PgDn : couche  ·  R/F : profondeur  ·  Echap : annuler drag");
+        sb.Append("Shift+molette ou PgUp/PgDn : couche  ·  R/F : profondeur  ·  Echap : annuler drag  ·  F12 : overlay frontier");
         if (_terrainMineDragTracking)
         {
             sb.AppendLine();
@@ -3433,10 +3656,29 @@ public partial class Game : Node3D
         bool smallDrag = dist <= TerrainMineDragMaxClickPixels;
 
         if (smallDrag && _selectionTargetKind == WorldSelectionTargetKind.TerrainTiles)
-            TryPickTerrainTilesAtViewport(GetTerrainPickViewportMouse());
+        {
+            if (_zonePaintMode != ZonePaintMode.None)
+            {
+                if (TryGetDragModeCellViewport(vpEnd, out Vector3I zoneCell))
+                {
+                    _terrainLineBuffer.Clear();
+                    _terrainLineBuffer.Add(zoneCell);
+                    ApplyZonePaintFromCells(_terrainLineBuffer, removeCells: shift);
+                }
+            }
+            else
+                TryPickTerrainTilesAtViewport(GetTerrainPickViewportMouse());
+        }
         else if (smallDrag && _selectionTargetKind == WorldSelectionTargetKind.BuildBlocks)
         {
-            if (_buildPreviewCell.HasValue)
+            // En build, même un "clic" doit respecter la profondeur R/F.
+            if (_terrainMineDragStartCell.HasValue
+                && TryGetDragModeCellViewport(vpEnd, out Vector3I endBuildCell))
+            {
+                FillBuildExtrudeArea(_terrainMineDragStartCell.Value, endBuildCell, _terrainLineBuffer);
+                TryQueueBuildFromCells(_terrainLineBuffer);
+            }
+            else if (_buildPreviewCell.HasValue)
                 TryQueueBuildBlockAtCell(_buildPreviewCell.Value);
         }
         else if (_terrainMineDragStartCell.HasValue && TryGetDragModeCellViewport(vpEnd, out Vector3I endCell))
@@ -3448,17 +3690,24 @@ public partial class Game : Node3D
             var map = sim.World.CurrentMap;
             if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles)
             {
-                if (!shift)
-                    _selectedTerrainTiles.Clear();
-                BuildOrderedMineSelection(_terrainLineBuffer, _orderedVoxelSelectionBuffer);
-                foreach (var c in _orderedVoxelSelectionBuffer)
+                if (_zonePaintMode != ZonePaintMode.None)
                 {
-                    _selectedTerrainTiles.Add(c);
+                    ApplyZonePaintFromCells(_terrainLineBuffer, removeCells: shift);
                 }
-                UpdateSelectionTargetUi();
+                else
+                {
+                    if (!shift)
+                        _selectedTerrainTiles.Clear();
+                    BuildOrderedMineSelection(_terrainLineBuffer, _orderedVoxelSelectionBuffer);
+                    foreach (var c in _orderedVoxelSelectionBuffer)
+                    {
+                        _selectedTerrainTiles.Add(c);
+                    }
+                    UpdateSelectionTargetUi();
+                }
             }
             else if (_selectionTargetKind == WorldSelectionTargetKind.BuildBlocks)
-                TryQueueBuildSiteFromCells(_terrainLineBuffer);
+                TryQueueBuildFromCells(_terrainLineBuffer);
         }
         else if (_selectionTargetKind == WorldSelectionTargetKind.TerrainTiles)
             TryPickTerrainTilesAtViewport(vpEnd);
@@ -3597,7 +3846,7 @@ public partial class Game : Node3D
         GD.Print($"[Jobs] Construction ajoutée @ {placeCell} (file : {sim.jobBoard.ActiveJobCount})");
     }
 
-    void TryQueueBuildSiteFromCells(List<Vector3I> cells)
+    void TryQueueBuildFromCells(List<Vector3I> cells)
     {
         if (sim?.World?.CurrentMap == null || cells == null || cells.Count == 0)
             return;
@@ -3623,6 +3872,76 @@ public partial class Game : Node3D
 
         if (valid.Count == 1)
             TryQueueBuildBlockAtCell(valid[0]);
+    }
+
+    void ApplyZonePaintFromCells(List<Vector3I> cells, bool removeCells)
+    {
+        if (sim == null || cells == null || cells.Count == 0 || _zonePaintMode == ZonePaintMode.None)
+            return;
+
+        _zonePaintResolvedBuffer.Clear();
+        _zonePaintResolvedSet.Clear();
+        foreach (var c in cells)
+        {
+            if (!TryResolveZonePaintCell(c, out var resolved))
+                continue;
+            if (_zonePaintResolvedSet.Add(resolved))
+                _zonePaintResolvedBuffer.Add(resolved);
+        }
+        if (_zonePaintResolvedBuffer.Count == 0)
+            return;
+
+        int changed = 0;
+        if (_zonePaintMode == ZonePaintMode.Stockpile)
+            changed = removeCells
+                ? sim.RemoveStockpileCells(_zonePaintResolvedBuffer)
+                : sim.SetStockpileCells(_zonePaintResolvedBuffer, replace: false);
+        else if (_zonePaintMode == ZonePaintMode.Recovery)
+            changed = removeCells
+                ? sim.RemoveRecoveryCells(_zonePaintResolvedBuffer)
+                : sim.SetRecoveryCells(_zonePaintResolvedBuffer, replace: false);
+
+        string zoneName = _zonePaintMode == ZonePaintMode.Stockpile ? "stockpile" : "récupération";
+        if (changed > 0)
+            GD.Print($"[Zones] {zoneName} {(removeCells ? "-" : "+")}{changed} cellule(s).");
+
+        UpdateSelectionTargetUi();
+    }
+
+    bool TryResolveZonePaintCell(Vector3I source, out Vector3I resolved)
+    {
+        resolved = default;
+        if (sim?.World?.CurrentMap == null)
+            return false;
+
+        var map = sim.World.CurrentMap;
+        var tile = map.GetTile(source);
+        if (tile == null)
+            return false;
+
+        if (!tile.Solid && sim.IsWalkableCell(source))
+        {
+            resolved = source;
+            return true;
+        }
+
+        var up = source + Vector3I.Up;
+        var upTile = map.GetTile(up);
+        if (upTile != null && !upTile.Solid && sim.IsWalkableCell(up))
+        {
+            resolved = up;
+            return true;
+        }
+
+        var down = source + Vector3I.Down;
+        var downTile = map.GetTile(down);
+        if (downTile != null && !downTile.Solid && sim.IsWalkableCell(down))
+        {
+            resolved = down;
+            return true;
+        }
+
+        return false;
     }
 
     void InitBuildPreviewGhost()
@@ -3706,6 +4025,78 @@ public partial class Game : Node3D
         _virtualScaffoldPreview.MaterialOverride = _virtualScaffoldPreviewMaterial;
         _virtualScaffoldPreview.Visible = false;
         AddChild(_virtualScaffoldPreview);
+    }
+
+    void InitBuildFrontierDebugPreviewVisual()
+    {
+        _buildFrontierDebugPreview = new MultiMeshInstance3D();
+        var mm = new MultiMesh
+        {
+            TransformFormat = MultiMesh.TransformFormatEnum.Transform3D,
+            UseColors = true,
+            InstanceCount = 0,
+            Mesh = _tileCubeMesh
+        };
+        _buildFrontierDebugPreview.Multimesh = mm;
+        _buildFrontierDebugMaterial = new StandardMaterial3D();
+        _buildFrontierDebugMaterial.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
+        _buildFrontierDebugMaterial.ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded;
+        _buildFrontierDebugMaterial.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+        _buildFrontierDebugMaterial.NoDepthTest = true;
+        _buildFrontierDebugMaterial.VertexColorUseAsAlbedo = true;
+        _buildFrontierDebugPreview.MaterialOverride = _buildFrontierDebugMaterial;
+        _buildFrontierDebugPreview.Visible = false;
+        AddChild(_buildFrontierDebugPreview);
+    }
+
+    void InitStockpilePreviewVisual()
+    {
+        _stockpilePreview = new MultiMeshInstance3D();
+        var mm = new MultiMesh
+        {
+            TransformFormat = MultiMesh.TransformFormatEnum.Transform3D,
+            UseColors = false,
+            InstanceCount = 0,
+            Mesh = _tileCubeMesh
+        };
+        _stockpilePreview.Multimesh = mm;
+        _stockpilePreviewMaterial = new StandardMaterial3D();
+        _stockpilePreviewMaterial.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
+        _stockpilePreviewMaterial.ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded;
+        _stockpilePreviewMaterial.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+        _stockpilePreviewMaterial.NoDepthTest = true;
+        _stockpilePreviewMaterial.EmissionEnabled = true;
+        _stockpilePreviewMaterial.Emission = new Color(0.12f, 0.65f, 1f);
+        _stockpilePreviewMaterial.EmissionEnergyMultiplier = 0.45f;
+        _stockpilePreviewMaterial.AlbedoColor = new Color(0.12f, 0.65f, 1f, 0.33f);
+        _stockpilePreview.MaterialOverride = _stockpilePreviewMaterial;
+        _stockpilePreview.Visible = false;
+        AddChild(_stockpilePreview);
+    }
+
+    void InitRecoveryZonePreviewVisual()
+    {
+        _recoveryZonePreview = new MultiMeshInstance3D();
+        var mm = new MultiMesh
+        {
+            TransformFormat = MultiMesh.TransformFormatEnum.Transform3D,
+            UseColors = false,
+            InstanceCount = 0,
+            Mesh = _tileCubeMesh
+        };
+        _recoveryZonePreview.Multimesh = mm;
+        _recoveryZonePreviewMaterial = new StandardMaterial3D();
+        _recoveryZonePreviewMaterial.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
+        _recoveryZonePreviewMaterial.ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded;
+        _recoveryZonePreviewMaterial.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+        _recoveryZonePreviewMaterial.NoDepthTest = true;
+        _recoveryZonePreviewMaterial.EmissionEnabled = true;
+        _recoveryZonePreviewMaterial.Emission = new Color(0.86f, 0.32f, 1f);
+        _recoveryZonePreviewMaterial.EmissionEnergyMultiplier = 0.45f;
+        _recoveryZonePreviewMaterial.AlbedoColor = new Color(0.86f, 0.32f, 1f, 0.30f);
+        _recoveryZonePreview.MaterialOverride = _recoveryZonePreviewMaterial;
+        _recoveryZonePreview.Visible = false;
+        AddChild(_recoveryZonePreview);
     }
 
     void ApplyBuildPreviewGhostAppearance()
@@ -3796,7 +4187,9 @@ public partial class Game : Node3D
             return;
         }
 
-        if (_lastBuildQueuedPreviewRefreshTick == sim.Tick)
+        int refreshEveryTicks = Mathf.Max(1, BuildQueuedPreviewRefreshTicks);
+        if (_lastBuildQueuedPreviewRefreshTick >= 0
+            && sim.Tick - _lastBuildQueuedPreviewRefreshTick < refreshEveryTicks)
             return;
         _lastBuildQueuedPreviewRefreshTick = sim.Tick;
 
@@ -3809,15 +4202,20 @@ public partial class Game : Node3D
         }
 
         var map = sim.World.CurrentMap;
-        int count = 0;
+        _queuedBuildVisiblePreviewBuffer.Clear();
+        int maxInstances = Mathf.Max(16, BuildQueuedPreviewMaxInstances);
         foreach (var c in _queuedBuildTargetsBuffer)
         {
             var t = map.GetTile(c);
             if (t == null || !t.Solid)
-                count++;
+            {
+                _queuedBuildVisiblePreviewBuffer.Add(c);
+                if (_queuedBuildVisiblePreviewBuffer.Count >= maxInstances)
+                    break;
+            }
         }
 
-        if (count == 0)
+        if (_queuedBuildVisiblePreviewBuffer.Count == 0)
         {
             _buildQueuedPreview.Visible = false;
             _buildQueuedPreview.Multimesh.InstanceCount = 0;
@@ -3829,15 +4227,10 @@ public partial class Game : Node3D
         _buildQueuedPreviewMaterial.AlbedoColor = new Color(baseRgb.R, baseRgb.G, baseRgb.B, a);
 
         var mm = _buildQueuedPreview.Multimesh;
-        mm.InstanceCount = count;
+        mm.InstanceCount = _queuedBuildVisiblePreviewBuffer.Count;
         int i = 0;
-        foreach (var c in _queuedBuildTargetsBuffer)
-        {
-            var t = map.GetTile(c);
-            if (t != null && t.Solid)
-                continue;
+        foreach (var c in _queuedBuildVisiblePreviewBuffer)
             mm.SetInstanceTransform(i++, new Transform3D(Basis.Identity, new Vector3(c.X, c.Y, c.Z)));
-        }
         _buildQueuedPreview.Visible = true;
     }
 
@@ -3885,6 +4278,214 @@ public partial class Game : Node3D
         foreach (var c in sim.VirtualScaffoldCells)
             mm.SetInstanceTransform(i++, new Transform3D(Basis.Identity, new Vector3(c.X, c.Y, c.Z)));
         _virtualScaffoldPreview.Visible = true;
+    }
+
+    void UpdateBuildFrontierDebugPreviewVisual()
+    {
+        if (_buildFrontierDebugPreview?.Multimesh == null
+            || _buildFrontierDebugMaterial == null
+            || sim == null)
+            return;
+
+        bool show = ShowBuildFrontierDebug
+            && _selectionTargetKind == WorldSelectionTargetKind.BuildBlocks;
+        if (!show)
+        {
+            if (_lastBuildFrontierDebugVisible)
+            {
+                _buildFrontierDebugPreview.Visible = false;
+                _buildFrontierDebugPreview.Multimesh.InstanceCount = 0;
+                _lastBuildFrontierDebugVisible = false;
+            }
+            return;
+        }
+
+        _lastBuildFrontierDebugVisible = true;
+        int refreshEveryTicks = Mathf.Max(1, BuildFrontierDebugRefreshTicks);
+        if (_lastBuildFrontierDebugRefreshTick >= 0
+            && sim.Tick - _lastBuildFrontierDebugRefreshTick < refreshEveryTicks)
+        {
+            if (!_buildFrontierDebugPreview.Visible)
+                _buildFrontierDebugPreview.Visible = true;
+            return;
+        }
+
+        _lastBuildFrontierDebugRefreshTick = sim.Tick;
+        sim.CopyBuildFrontierDebug(_buildFrontierDebugBuffer, Mathf.Max(16, BuildFrontierDebugMaxInstances));
+        if (_buildFrontierDebugBuffer.Count == 0)
+        {
+            _buildFrontierDebugPreview.Visible = false;
+            _buildFrontierDebugPreview.Multimesh.InstanceCount = 0;
+            return;
+        }
+
+        var mm = _buildFrontierDebugPreview.Multimesh;
+        mm.InstanceCount = _buildFrontierDebugBuffer.Count;
+        float a = Mathf.Clamp(BuildFrontierDebugAlpha, 0.05f, 1f);
+        for (int i = 0; i < _buildFrontierDebugBuffer.Count; i++)
+        {
+            var cell = _buildFrontierDebugBuffer[i];
+            mm.SetInstanceTransform(i, new Transform3D(Basis.Identity, new Vector3(cell.Position.X, cell.Position.Y, cell.Position.Z)));
+            mm.SetInstanceColor(i, GetBuildFrontierDebugColor(cell.State, a));
+        }
+
+        _buildFrontierDebugPreview.Visible = true;
+    }
+
+    void UpdateStockpilePreviewVisual()
+    {
+        if (_stockpilePreview?.Multimesh == null || sim == null)
+            return;
+
+        bool show = ShowStockpileCells
+            && _selectionTargetKind == WorldSelectionTargetKind.TerrainTiles
+            && sim.StockpileCells != null
+            && sim.StockpileCells.Count > 0;
+        if (!show)
+        {
+            if (_lastStockpilePreviewVisible)
+            {
+                _stockpilePreview.Visible = false;
+                _stockpilePreview.Multimesh.InstanceCount = 0;
+                _lastStockpilePreviewVisible = false;
+                _lastStockpilePreviewCount = -1;
+                _lastStockpilePreviewHash = int.MinValue;
+            }
+            return;
+        }
+
+        _lastStockpilePreviewVisible = true;
+        int count = sim.StockpileCells.Count;
+        int hash = count;
+        foreach (var c in sim.StockpileCells)
+            hash = unchecked(hash * 397 ^ c.GetHashCode());
+        if (_lastStockpilePreviewCount == count && _lastStockpilePreviewHash == hash && _stockpilePreview.Visible)
+            return;
+        _lastStockpilePreviewCount = count;
+        _lastStockpilePreviewHash = hash;
+
+        var mm = _stockpilePreview.Multimesh;
+        mm.InstanceCount = count;
+        int i = 0;
+        foreach (var c in sim.StockpileCells)
+            mm.SetInstanceTransform(i++, new Transform3D(Basis.Identity, new Vector3(c.X, c.Y, c.Z)));
+        _stockpilePreview.Visible = true;
+    }
+
+    void UpdateRecoveryZonePreviewVisual()
+    {
+        if (_recoveryZonePreview?.Multimesh == null || sim == null)
+            return;
+
+        bool show = ShowRecoveryCells
+            && _selectionTargetKind == WorldSelectionTargetKind.TerrainTiles
+            && sim.RecoveryCells != null
+            && sim.RecoveryCells.Count > 0;
+        if (!show)
+        {
+            if (_lastRecoveryZonePreviewVisible)
+            {
+                _recoveryZonePreview.Visible = false;
+                _recoveryZonePreview.Multimesh.InstanceCount = 0;
+                _lastRecoveryZonePreviewVisible = false;
+                _lastRecoveryZonePreviewCount = -1;
+                _lastRecoveryZonePreviewHash = int.MinValue;
+            }
+            return;
+        }
+
+        _lastRecoveryZonePreviewVisible = true;
+        int count = sim.RecoveryCells.Count;
+        int hash = count;
+        foreach (var c in sim.RecoveryCells)
+            hash = unchecked(hash * 397 ^ c.GetHashCode());
+        if (_lastRecoveryZonePreviewCount == count && _lastRecoveryZonePreviewHash == hash && _recoveryZonePreview.Visible)
+            return;
+        _lastRecoveryZonePreviewCount = count;
+        _lastRecoveryZonePreviewHash = hash;
+
+        var mm = _recoveryZonePreview.Multimesh;
+        mm.InstanceCount = count;
+        int i = 0;
+        foreach (var c in sim.RecoveryCells)
+            mm.SetInstanceTransform(i++, new Transform3D(Basis.Identity, new Vector3(c.X, c.Y, c.Z)));
+        _recoveryZonePreview.Visible = true;
+    }
+
+    void RefreshColonNeedsUi()
+    {
+        if (selectionManager == null)
+            return;
+        string text;
+        if (selectionManager.SelectedColonists.Count == 0)
+        {
+            text = "Besoins : sélectionner un colon";
+            if (_colonNeedsLabel != null)
+                _colonNeedsLabel.Text = text;
+            if (_selectionTargetKind == WorldSelectionTargetKind.Colonists && _treeTargetLabel != null)
+                _treeTargetLabel.Text = "Colon : (aucun)";
+            return;
+        }
+
+        if (selectionManager.SelectedColonists.Count == 1)
+        {
+            var c = selectionManager.SelectedColonists[0];
+            string rec = c.NeedsRecoveryCell.HasValue ? c.NeedsRecoveryCell.Value.ToString() : "(auto)";
+            text = $"Besoins : H={Mathf.RoundToInt(c.Hunger)} R={Mathf.RoundToInt(c.Rest)} · Etat={c.ActivityState} · Rec={rec}";
+            if (_colonNeedsLabel != null)
+                _colonNeedsLabel.Text = text;
+            // Also mirror in top visible label to avoid panel overflow hiding this info.
+            if (_treeTargetLabel != null)
+                _treeTargetLabel.Text = text;
+            if (_selectionTargetKind == WorldSelectionTargetKind.Colonists && _selectionModeLabel != null)
+                _selectionModeLabel.Text = "Cible : Colons (clic / cadre)\n" + text;
+            return;
+        }
+
+        float h = 0f, r = 0f;
+        int n = 0;
+        foreach (var c in selectionManager.SelectedColonists)
+        {
+            h += c.Hunger;
+            r += c.Rest;
+            n++;
+        }
+
+        if (n <= 0)
+        {
+            text = "Besoins : sélectionner un colon";
+            if (_colonNeedsLabel != null)
+                _colonNeedsLabel.Text = text;
+            return;
+        }
+
+        text = $"Besoins ({n}) : H~{Mathf.RoundToInt(h / n)} R~{Mathf.RoundToInt(r / n)}";
+        if (_colonNeedsLabel != null)
+            _colonNeedsLabel.Text = text;
+        if (_treeTargetLabel != null)
+            _treeTargetLabel.Text = text;
+        if (_selectionTargetKind == WorldSelectionTargetKind.Colonists && _selectionModeLabel != null)
+            _selectionModeLabel.Text = "Cible : Colons (clic / cadre)\n" + text;
+    }
+
+    string GetZonePaintModeLabel()
+    {
+        return _zonePaintMode switch
+        {
+            ZonePaintMode.Stockpile => "stockpile",
+            ZonePaintMode.Recovery => "récup",
+            _ => "off"
+        };
+    }
+
+    static Color GetBuildFrontierDebugColor(BuildFrontierDebugState state, float alpha)
+    {
+        return state switch
+        {
+            BuildFrontierDebugState.Ready => new Color(0.27f, 0.95f, 0.35f, alpha),
+            BuildFrontierDebugState.SupportedNoWalkSpot => new Color(1f, 0.74f, 0.2f, alpha),
+            _ => new Color(0.98f, 0.25f, 0.25f, alpha)
+        };
     }
 
     void TryPickTreeAtScreen()

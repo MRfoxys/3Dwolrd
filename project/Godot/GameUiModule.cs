@@ -5,7 +5,7 @@ public sealed class GameUiModule
 {
     readonly List<SimJob> scratchJobs = new();
 
-    public string BuildJobsQueueText(Simulation sim, int maxLines = 6)
+    public string BuildJobsQueueText(Simulation sim, int maxLines = 4)
     {
         if (sim?.jobBoard == null)
             return "Travail en attente : aucun";
@@ -49,6 +49,10 @@ public sealed class GameUiModule
     {
         if (sim == null)
             return "Logistique : indisponible";
-        return sim.GetLogisticsStatusText();
+        string text = sim.GetLogisticsStatusText();
+        const int maxChars = 220;
+        if (string.IsNullOrEmpty(text) || text.Length <= maxChars)
+            return text;
+        return text.Substring(0, maxChars - 1) + "…";
     }
 }
